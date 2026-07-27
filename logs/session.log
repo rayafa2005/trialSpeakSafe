@@ -1,0 +1,392 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260510213800
+Username: STARTREK23\reema
+RunAs User: STARTREK23\reema
+Configuration Name: 
+Machine: STARTREK23 (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -noexit -command try { . "c:\Users\reema\AppData\Local\Programs\Microsoft VS Code\8b640eef5a\resources\app\out\vs\workbench\contrib\terminal\common\scripts\shellIntegration.ps1" } catch {}
+Process ID: 18276
+PSVersion: 5.1.26100.8115
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8115
+BuildVersion: 10.0.26100.8115
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is logs\session.log
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 status_check.py
+WHAT TO DO NEXT
+============================================================
+  ✅✅ Ready to train! Run in a STANDALONE PowerShell window:
+     (Win+R → powershell → Enter — so it survives VS Code closing)
+
+     cd C:\Users\reema\Tatvaani\tatvaani_ml
+     py -3.11 training/train.py 2>&1 | Tee-Object train.log
+
+  This saves all output to train.log so you can check progress anytime:
+     Get-Content train.log -Tail 20
+
+  To check training progress anytime (even after VS Code restart):
+     Get-Content C:\Users\reema\Tatvaani\tatvaani_ml\train.log -Tail 30
+============================================================
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS># In VS Code terminal (quick fix — 2 minutes)
+cd C:\Users\reema\Tatvaani\tatvaani_ml
+py -3.11 process_dataset.py --dataset asvspoof --input data\raw\ASVspoof2019_LA
+py -3.11 process_dataset.py --dataset wavefake --input data\raw\WaveFake
+  Processed 119000/122299
+  Processed 119500/122299
+  Processed 120000/122299
+  Processed 120500/122299
+  Processed 121000/122299
+  [ASVspoof] Done: 121461 files → 139871 segments
+
+[Manifest] Written: 139871 entries → data\manifest.csv
+Traceback (most recent call last):
+  File "C:\Users\reema\Tatvaani\tatvaani_ml\process_dataset.py", line 569, in <module>
+    main()
+  File "C:\Users\reema\Tatvaani\tatvaani_ml\process_dataset.py", line 563, in main
+    print_stats(manifest_rows)
+  File "C:\Users\reema\Tatvaani\tatvaani_ml\process_dataset.py", line 482, in print_stats
+    genders  = Counter(r["gender"] for r in rows)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python311\Lib\collections\__init__.py", line 599, in __init__
+    self.update(iterable, **kwds)
+  File "C:\Python311\Lib\collections\__init__.py", line 690, in update
+    _count_elements(self, iterable)
+  File "C:\Users\reema\Tatvaani\tatvaani_ml\process_dataset.py", line 482, in <genexpr>
+    genders  = Counter(r["gender"] for r in rows)
+                       ~^^^^^^^^^^
+KeyError: 'gender'
+
+PS>TerminatingError(): "The pipeline has been stopped."
+>> TerminatingError(): "The pipeline has been stopped."
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS># Ctrl+C first to kill the hanging process, then:
+cd C:\Users\reema\Tatvaani\tatvaani_ml
+py -3.11 -c "
+import pandas as pd
+df = pd.read_csv('data/manifest.csv')
+print('Manifest rows:', len(df))
+print('Labels:', dict(df['label'].value_counts()))
+print('Datasets:', dict(df['dataset'].value_counts()))
+"
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 rebuild_manifest.py
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>cd C:\Users\reema\Tatvaani\tatvaani_ml
+py -3.11 rebuild_manifest.py
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>cd C:\Users\reema\Tatvaani\tatvaani_ml\data\raw
+tar -xzf librispeech_100.tar.gz
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_ml\x5cdata\x5crawPS C:\Users\reema\Tatvaani\tatvaani_ml\data\raw> ]633;B
+PS>Get-ChildItem LibriSpeech -Recurse -Directory | Select-Object -First 10
+
+
+    Directory: C:\Users\reema\Tatvaani\tatvaani_ml\data\raw\LibriSpeech
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        16-08-2014     11:47                train-clean-100
+
+
+    Directory: C:\Users\reema\Tatvaani\tatvaani_ml\data\raw\LibriSpeech\train-clean-100
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        16-08-2014     11:14                103
+d-----        16-08-2014     11:29                1034
+d-----        16-08-2014     11:22                1040
+d-----        16-08-2014     11:07                1069
+d-----        16-08-2014     11:42                1081
+d-----        16-08-2014     11:02                1088
+d-----        16-08-2014     11:06                1098
+d-----        16-08-2014     11:05                1116
+d-----        16-08-2014     11:33                118
+
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_ml\x5cdata\x5crawPS C:\Users\reema\Tatvaani\tatvaani_ml\data\raw> ]633;B
+PS>py -3.11 process_librispeech.py
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_ml\x5cdata\x5crawPS C:\Users\reema\Tatvaani\tatvaani_ml\data\raw> ]633;B
+PS>cd C:\Users\reema\Tatvaani\tatvaani_ml
+py -3.11 process_librispeech.py
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 split_dataset.py
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS># Fix: replace emoji in train.py with plain text
+(Get-Content training\train.py -Raw) -replace '✅ First batch OK','[OK] First batch OK' -replace '✅ New best','[BEST]' | Set-Content training\train.py
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>cd C:\Users\reema\Tatvaani\tatvaani_ml
+$env:PYTHONIOENCODING="utf-8"
+py -3.11 training\train.py 2>&1 | Tee-Object -FilePath train.log -Encoding utf8
+PS>TerminatingError(Tee-Object): "A parameter cannot be found that matches parameter name 'Encoding'."
+Tee-Object : A parameter cannot be found that matches parameter name 'Encoding'.
+At line:3 char:66
++ ... raining\train.py 2>&1 | Tee-Object -FilePath train.log -Encoding utf8
++                                                            ~~~~~~~~~
+    + CategoryInfo          : InvalidArgument: (:) [Tee-Object], ParameterBindingException
+    + FullyQualifiedErrorId : NamedParameterNotFound,Microsoft.PowerShell.Commands.TeeObjectCommand
+Tee-Object : A parameter cannot be found that matches parameter name 'Encoding'.
+At line:3 char:66
++ ... raining\train.py 2>&1 | Tee-Object -FilePath train.log -Encoding utf8
++                                                            ~~~~~~~~~
+    + CategoryInfo          : InvalidArgument: (:) [Tee-Object], ParameterBindingException
+    + FullyQualifiedErrorId : NamedParameterNotFound,Microsoft.PowerShell.Commands.TeeObjectCommand
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>$env:PYTHONIOENCODING="utf-8"
+py -3.11 training\train.py | Tee-Object -FilePath train.log
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>$env:PYTHONIOENCODING="utf-8"
+py -3.11 training\train.py
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 -c "
+path = 'training/train.py'
+text = open(path, encoding='utf-8').read()
+
+# Fix 1: remove emoji that crashes on Windows
+text = text.replace('\u2705', '[OK]')
+text = text.replace('\u274c', '[FAIL]')
+text = text.replace('\u26a0', '[WARN]')
+
+# Fix 2: divide by zero in alpha weights
+text = text.replace(
+    'counts_arr  = np.array([class_counts.get(c, 1) for c in range(config[\"num_classes\"])], dtype=float)',
+    'counts_arr  = np.array([max(class_counts.get(c, 0), 1) for c in range(config[\"num_classes\"])], dtype=float)'
+)
+
+open(path, 'w', encoding='utf-8').write(text)
+print('Done')
+"
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 fix_train.py
+py -3.11 training\train.py
+
+[Train] Model parameters: 939,443
+[Train] Epochs: 50, Batch: 32, LR: 0.001
+[FocalLoss] Class distribution: {0: np.int64(91284), 1: np.int64(0), 2: np.int64(279528)}
+[FocalLoss] Alpha weights: [3.062179571447351, 279528.0, 1.0]
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+[Train] Device: cuda
+[Train] GPU: NVIDIA GeForce RTX 2060
+[Train] VRAM: 6.4 GB
+[Train] TensorBoard logs: C:\Users\reema\Tatvaani\tatvaani_ml\runs\tatvanet
+[Train] Run: tensorboard --logdir C:\Users\reema\Tatvaani\tatvaani_ml\runs\tatvanet
+
+[Train] Loading datasets...
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\train_manifest.csv
+[Dataset] Loaded 370812 samples from train_manifest.csv
+[Dataset] Label distribution: {0: np.int64(91284), 2: np.int64(279528)}
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\val_manifest.csv
+[Dataset] Loaded 22280 samples from val_manifest.csv
+[Dataset] Label distribution: {0: np.int64(13570), 2: np.int64(8710)}
+[Train] Verifying first batch loads correctly...
+[Train] [OK] First batch OK — waveforms: torch.Size([32, 1, 48000]), labels: torch.Size([32])
+[Train]    Label values in batch: [0, 2]
+[Train] Model parameters: 939,443
+[Train] Epochs: 50, Batch: 32, LR: 0.001
+[FocalLoss] Class distribution: {0: np.int64(91284), 1: np.int64(0), 2: np.int64(279528)}
+[FocalLoss] Alpha weights: [3.0, 2.0, 1.0] (fixed)
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\train_manifest.csv
+[Dataset] Loaded 370812 samples from train_manifest.csv
+[Dataset] Label distribution: {0: np.int64(91284), 2: np.int64(279528)}
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\val_manifest.csv
+[Dataset] Loaded 22280 samples from val_manifest.csv
+[Dataset] Label distribution: {0: np.int64(13570), 2: np.int64(8710)}
+[Train] Verifying first batch loads correctly...
+[Train] [OK] First batch OK — waveforms: torch.Size([32, 1, 48000]), labels: torch.Size([32])
+[Train]    Label values in batch: [0, 2]
+[Train] Model parameters: 939,443
+[Train] Epochs: 50, Batch: 32, LR: 0.001
+[FocalLoss] Class distribution: {0: np.int64(91284), 1: np.int64(0), 2: np.int64(279528)}
+[FocalLoss] Alpha weights: [3.0, 2.0, 1.0] (fixed)
+[Train] FocalLoss created OK
+[Train] Starting optimizer setup...
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+
+[Train] Loading datasets...
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\train_manifest.csv
+[Dataset] Loaded 370812 samples from train_manifest.csv
+[Dataset] Label distribution: {0: np.int64(91284), 2: np.int64(279528)}
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\val_manifest.csv
+[Dataset] Loaded 22280 samples from val_manifest.csv
+[Dataset] Label distribution: {0: np.int64(13570), 2: np.int64(8710)}
+[Train] Verifying first batch loads correctly...
+[Train] [OK] First batch OK — waveforms: torch.Size([32, 1, 48000]), labels: torch.Size([32])
+[Train]    Label values in batch: [0, 2]
+[Train] Model parameters: 939,443
+[Train] Epochs: 50, Batch: 32, LR: 0.001
+[FocalLoss] Class distribution: {0: np.int64(91284), 1: np.int64(0), 2: np.int64(279528)}
+[FocalLoss] Alpha weights: [3.0, 2.0, 1.0] (fixed)
+[Train] FocalLoss created OK
+[Train] Starting optimizer setup...
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 -c "
+import sys
+sys.path.insert(0, '.')
+from model.tatvanet import TatvaNet
+import torch
+model = TatvaNet().cuda()
+params = list(model.parameters())
+print(f'Total param tensors: {len(params)}')
+print(f'Any None grad: {any(p is None for p in params)}')
+try:
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    print(f'AdamW OK')
+except Exception as e:
+    print(f'AdamW FAILED: {e}')
+"
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 -c "
+import torch
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'CUDA version: {torch.version.cuda}')
+print(f'Device: {torch.cuda.get_device_name(0)}')
+# Try allocating memory
+x = torch.randn(1000, 1000).cuda()
+y = torch.randn(1000, 1000).cuda()
+z = x @ y
+print(f'CUDA compute: OK — result shape {z.shape}')
+del x, y, z
+torch.cuda.empty_cache()
+print(f'CUDA memory OK')
+"
+CUDA available: True
+CUDA version: 12.1
+Device: NVIDIA GeForce RTX 2060
+CUDA compute: OK — result shape torch.Size([1000, 1000])
+CUDA memory OK
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS># Check GPU driver status
+Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion, Status
+
+Name                               DriverVersion Status
+----                               ------------- ------
+NVIDIA GeForce RTX 2060            32.0.15.5597  OK
+AMD Radeon(TM) RX Vega 10 Graphics 27.20.1032.2  OK
+
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+[Dataset] Loaded 370812 samples from train_manifest.csv
+[Dataset] Label distribution: {0: np.int64(91284), 2: np.int64(279528)}
+[Dataset] Loading manifest: C:\Users\reema\Tatvaani\tatvaani_ml\data\val_manifest.csv
+[Dataset] Loaded 22280 samples from val_manifest.csv
+[Dataset] Label distribution: {0: np.int64(13570), 2: np.int64(8710)}
+[Train] Verifying first batch loads correctly...
+[Train] [OK] First batch OK — waveforms: torch.Size([32, 1, 48000]), labels: torch.Size([32])
+[Train]    Label values in batch: [0, 2]
+[Train] Model parameters: 939,443
+[Train] Epochs: 50, Batch: 32, LR: 0.001
+[FocalLoss] Class distribution: {0: np.int64(91284), 1: np.int64(0), 2: np.int64(279528)}
+[FocalLoss] Alpha weights: [3.0, 2.0, 1.0] (fixed)
+[Train] FocalLoss created OK
+[Train] Starting optimizer setup...
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 -m pip uninstall tensorflow tensorflow-intel keras -y
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 training\train.py
+
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 -m pip install sounddevice scipy matplotlib
+py -3.11 demo_record.py
+Downloading kiwisolver-1.5.0-cp311-cp311-win_amd64.whl (73 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 73.5/73.5 kB 672.8 kB/s eta 0:00:00
+Using cached pyparsing-3.3.2-py3-none-any.whl (122 kB)
+Installing collected packages: pyparsing, kiwisolver, fonttools, cycler, contourpy, sounddevice, matplotlib
+  WARNING: The scripts fonttools.exe, pyftmerge.exe, pyftsubset.exe and ttx.exe are installed in 'C:\Python311\S
+cripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-locati
+on.
+Successfully installed contourpy-1.3.3 cycler-0.12.1 fonttools-4.62.1 kiwisolver-1.5.0 matplotlib-3.10.9 pyparsi
+ng-3.3.2 sounddevice-0.5.5
+
+[notice] A new release of pip is available: 24.0 -> 26.1.1
+[notice] To update, run: C:\Python311\python.exe -m pip install --upgrade pip
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python311\Lib\site-packages\matplotlib\backend_bases.py", line 3550, in show
+    cls.mainloop()
+  File "C:\Python311\Lib\site-packages\matplotlib\backends\_backend_tk.py", line 572, in start_main_loop
+    first_manager.window.mainloop()
+  File "C:\Python311\Lib\tkinter\__init__.py", line 1504, in mainloop
+    self.tk.mainloop(n)
+KeyboardInterrupt
+PS>TerminatingError(): "The pipeline has been stopped."
+>> TerminatingError(): "The pipeline has been stopped."
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 demo_preprocess_visual.py
+
+PS>TerminatingError(): "The pipeline has been stopped."
+>> TerminatingError(): "The pipeline has been stopped."
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 tatvaani_live_demo.py
+
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 tatvaani_live_demo.py
+
+PS>TerminatingError(): "The pipeline has been stopped."
+>> TerminatingError(): "The pipeline has been stopped."
+]633;D;1]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 tatvaani_live_demo.py
+  ✅✅ Preprocessing complete
+
+C:\Users\reema\Tatvaani\tatvaani_ml\tatvaani_live_demo.py:247: UserWarning: Glyph 128308 (\N{LARGE RED CIRCLE})
+missing from font(s) DejaVu Sans Mono.
+  plt.savefig(str(OUT_DIR/"tatvaani_pipeline_demo.png"),
+  ✅✅ Saved: demo_output/tatvaani_pipeline_demo.png
+
+�� RAW audio (fan noise audible)...
+�� CLEAN audio (fan noise removed)...
+
+============================================================
+  Demo complete!
+============================================================
+C:\Python311\Lib\tkinter\__init__.py:861: UserWarning: Glyph 128308 (\N{LARGE RED CIRCLE}) missing from font(s)
+DejaVu Sans Mono.
+  func(*args)
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
+PS>py -3.11 tatvaani_live_demo.py
+  ✅✅ Preprocessing complete
+
+C:\Users\reema\Tatvaani\tatvaani_ml\tatvaani_live_demo.py:247: UserWarning: Glyph 128308 (\N{LARGE RED CIRCLE})
+missing from font(s) DejaVu Sans Mono.
+  plt.savefig(str(OUT_DIR/"tatvaani_pipeline_demo.png"),
+  ✅✅ Saved: demo_output/tatvaani_pipeline_demo.png
+
+�� RAW audio (fan noise audible)...
+�� CLEAN audio (fan noise removed)...
+
+============================================================
+  Demo complete!
+============================================================
+C:\Python311\Lib\tkinter\__init__.py:861: UserWarning: Glyph 128308 (\N{LARGE RED CIRCLE}) missing from font(s)
+DejaVu Sans Mono.
+  func(*args)
+]633;D;0]633;A]633;P;Cwd=C:\x5cUsers\x5creema\x5cTatvaani\x5ctatvaani_mlPS C:\Users\reema\Tatvaani\tatvaani_ml> ]633;B
