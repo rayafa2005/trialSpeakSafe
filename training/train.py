@@ -1,8 +1,8 @@
 """
 Tatvaani - TatvaNet Training Script
 =====================================
-Run: py -3.11 training/train.py
-     py -3.11 training/train.py --resume checkpoints/last_checkpoint.pt
+Run: py -3.10 training/train.py
+     py -3.10 training/train.py --resume checkpoints/last_checkpoint.pt
 """
 
 import sys
@@ -12,14 +12,18 @@ import time
 import traceback
 from pathlib import Path
 
+# Force unbuffered output so Windows PowerShell prints every update immediately
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 import numpy as np
 import pandas as pd
+import soundfile as sf
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchaudio
 import torchaudio.transforms as T
-# PyTorch 2.x AMP API — torch.amp replaces deprecated torch.cuda.amp
 import torch.amp
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import roc_curve
@@ -43,20 +47,21 @@ CONFIG = {
     "checkpoint_dir":      "checkpoints",
     "log_dir":             "runs/tatvanet",
     "sample_rate":         16000,
-    "min_duration":        1.0,
-    "max_duration":        4.0,
-    "target_samples":      48000,
+    "min_duration":        0.5,
+    "max_duration":        2.0,
+    "target_samples":      32000,  # 2.0 seconds at 16kHz
     "epochs":              50,
-    "batch_size":          32,
+    "batch_size":          64,     # Optimized for RTX 4060 8GB VRAM
     "lr":                  1e-3,
     "lr_min":              1e-5,
     "warmup_epochs":       3,
     "early_stop_patience": 7,
     "grad_clip":           1.0,
-    "num_workers":         0,      # must be 0 on Windows
-    "pin_memory":          False,  # False is safer on Windows with num_workers=0
-    "num_classes":         3,
+    "num_workers":         0,      # Safe for Windows
+    "pin_memory":          False,
+    "num_classes":         2,      # 0=Safe/Real, 1=Danger/Fake
     "augment_train":       True,
+    "log_interval":        20,     # Print progress every 20 batches
 }
 
 
@@ -82,50 +87,41 @@ class TatvaaniDataset(Dataset):
         if not manifest_path.is_absolute():
             manifest_path = ML_ROOT / manifest_path
 
-        print(f"[Dataset] Loading manifest: {manifest_path}")
+        print(f"[Dataset] Loading manifest: {manifest_path}", flush=True)
         df = pd.read_csv(manifest_path)
 
-        def resolve_path(p: str) -> Path:
-            p = Path(p)
-            if p.is_absolute():
-                return p
-            c = ML_ROOT / p
-            if c.exists():
-                return c
-            c2 = PROJECT_ROOT / p
-            if c2.exists():
-                return c2
-            return c
+        # Fast path resolution without slow synchronous disk syscalls
+        root_str = str(ML_ROOT)
+        df["abs_path"] = df["path"].apply(
+            lambda p: os.path.join(root_str, p) if not os.path.isabs(p) else p
+        )
 
-        df["abs_path"]  = df["path"].apply(resolve_path)
-        exists_mask     = df["abs_path"].apply(lambda p: p.exists())
-        n_missing       = (~exists_mask).sum()
-        if n_missing > 0:
-            print(f"[Dataset] WARNING: {n_missing}/{len(df)} files missing, skipping them.")
-            df = df[exists_mask].reset_index(drop=True)
-
-        if len(df) == 0:
-            raise RuntimeError("[Dataset] No audio files found on disk.")
-
+        # Map labels: 0 -> 0 (Safe/Real), anything > 0 -> 1 (Danger/Fake)
+        df["binary_label"] = df["label"].apply(lambda l: 1 if int(l) > 0 else 0)
         self.df = df
-        print(f"[Dataset] Loaded {len(self.df)} samples from {manifest_path.name}")
-        print(f"[Dataset] Label distribution: {dict(self.df['label'].value_counts().sort_index())}")
+        print(f"[Dataset] Loaded {len(self.df):,} samples from {manifest_path.name}", flush=True)
+        print(f"[Dataset] Binary label distribution: {dict(self.df['binary_label'].value_counts().sort_index())}", flush=True)
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row       = self.df.iloc[idx]
-        label     = int(row["label"])
-        audio_path = row["abs_path"]
+        label     = int(row["binary_label"])
+        audio_path = str(row["abs_path"])
 
         try:
-            waveform, sr = torchaudio.load(str(audio_path))
+            samples, sr = sf.read(audio_path, dtype="float32")
+            if samples.ndim > 1:
+                samples = samples.mean(axis=1)
+            waveform = torch.from_numpy(samples).unsqueeze(0)
         except Exception:
-            return torch.zeros(1, self.target_n), label
-
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+            try:
+                waveform, sr = torchaudio.load(audio_path)
+                if waveform.shape[0] > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+            except Exception:
+                return torch.zeros(1, self.target_n), label
 
         if sr != self.sr:
             waveform = T.Resample(sr, self.sr)(waveform)
@@ -166,29 +162,44 @@ def warmup_lr(optimizer, epoch, warmup_epochs, base_lr):
             pg["lr"] = lr
 
 
+def format_time(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m:02d}m {s:02d}s"
+
+
 @torch.no_grad()
 def validate(model, loader, criterion, device, config):
     model.eval()
     total_loss = 0.0
     all_scores = []
     all_labels = []
+    n_batches = len(loader)
 
-    for waveforms, labels in loader:
+    print("\n  [Validation] Evaluating on unseen speakers...", end="", flush=True)
+
+    for val_idx, (waveforms, labels) in enumerate(loader):
         waveforms = waveforms.to(device)
         labels    = labels.to(device)
 
-        # Use torch.amp.autocast with device_type string
         with torch.amp.autocast(device_type=device.type):
-            logits = model(waveforms)
+            out    = model(waveforms)
+            logits = out["logits"]
             loss   = criterion(logits, labels)
 
         total_loss += loss.item() * len(labels)
         probs       = torch.softmax(logits, dim=-1)
-        danger_prob = probs[:, 2].cpu().numpy()
-        binary_lbl  = np.where(labels.cpu().numpy() > 0, 1, 0)
+        danger_prob = probs[:, 1].cpu().numpy()  # Binary fake probability
         all_scores.extend(danger_prob.tolist())
-        all_labels.extend(binary_lbl.tolist())
+        all_labels.extend(labels.cpu().numpy().tolist())
 
+        if (val_idx + 1) % 50 == 0 or (val_idx + 1) == n_batches:
+            pct = 100.0 * (val_idx + 1) / n_batches
+            print(f"\r  [Validation] Progress: [{pct:5.1f}%] ({val_idx+1}/{n_batches} batches)", end="", flush=True)
+
+    print()  # newline
     avg_loss = total_loss / max(len(loader.dataset), 1)
     eer      = compute_eer(np.array(all_scores), np.array(all_labels))
     model.train()
@@ -197,68 +208,82 @@ def validate(model, loader, criterion, device, config):
 
 def train(config: dict, resume_path: str = None, debug: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Train] Device: {device}")
+    print(f"[Train] Device: {device}", flush=True)
     if device.type == "cuda":
-        print(f"[Train] GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[Train] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"[Train] GPU: {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"[Train] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB", flush=True)
 
     checkpoint_dir = ML_ROOT / config["checkpoint_dir"]
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir = ML_ROOT / config["log_dir"]
     writer  = SummaryWriter(log_dir=str(log_dir))
-    print(f"[Train] TensorBoard: tensorboard --logdir {log_dir}")
+    print(f"[Train] TensorBoard: tensorboard --logdir {log_dir}", flush=True)
 
     # Datasets
-    print("\n[Train] Loading datasets...")
+    print("\n[Train] Loading datasets...", flush=True)
     train_dataset = TatvaaniDataset(config["train_manifest"], config, augment=config["augment_train"])
     val_dataset   = TatvaaniDataset(config["val_manifest"],   config, augment=False)
 
     if debug:
         from torch.utils.data import Subset
-        train_dataset = Subset(train_dataset, list(range(min(64, len(train_dataset)))))
-        val_dataset   = Subset(val_dataset,   list(range(min(32, len(val_dataset)))))
+        train_dataset = Subset(train_dataset, list(range(min(128, len(train_dataset)))))
+        val_dataset   = Subset(val_dataset,   list(range(min(64, len(val_dataset)))))
         config["epochs"] = 2
 
+    batch_size = config["batch_size"]
     train_loader = DataLoader(
-        train_dataset, batch_size=config["batch_size"],
-        shuffle=True, num_workers=0, pin_memory=False,
+        train_dataset, batch_size=batch_size,
+        shuffle=True, num_workers=4, pin_memory=False,
         collate_fn=collate_fn, drop_last=True,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=config["batch_size"] * 2,
-        shuffle=False, num_workers=0, pin_memory=False,
+        val_dataset, batch_size=batch_size * 2,
+        shuffle=False, num_workers=4, pin_memory=False,
         collate_fn=collate_fn,
     )
 
     # Verify first batch
-    print("[Train] Verifying first batch...")
+    print("[Train] Verifying first batch...", flush=True)
     try:
         wb, lb = next(iter(train_loader))
-        print(f"[Train] First batch OK — waveforms: {wb.shape}, labels: {lb.shape}")
-        print(f"[Train] Label values: {lb.unique().tolist()}")
+        print(f"[Train] First batch OK — waveforms: {wb.shape}, labels: {lb.shape}", flush=True)
+        print(f"[Train] Label values: {lb.unique().tolist()}", flush=True)
     except Exception as e:
-        print(f"[Train] FIRST BATCH FAILED: {e}")
+        print(f"[Train] FIRST BATCH FAILED: {e}", flush=True)
         traceback.print_exc()
         sys.exit(1)
 
     # Model
-    model = TatvaNet().to(device)
+    model = TatvaNet(sample_rate=config["sample_rate"], n_classes=config["num_classes"]).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Train] Model parameters: {n_params:,}")
-    print(f"[Train] Epochs: {config['epochs']}, Batch: {config['batch_size']}, LR: {config['lr']}")
+    print(f"[Train] Model parameters: {n_params:,}", flush=True)
+    print(f"[Train] Epochs: {config['epochs']}, Batch: {batch_size}, LR: {config['lr']}", flush=True)
 
-    # Fixed alpha weights — Safe=3x, Caution=2x, Danger=1x
-    # Fixed because Caution class has 0 training samples (binary dataset)
-    # Dynamic computation causes div-by-zero and inf weights
-    alpha_tensor = torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32).to(device)
-    print(f"[Train] FocalLoss alpha weights: {alpha_tensor.tolist()} (fixed)")
+    # Compute dynamic class weights to balance Real vs Fake audio
+    if hasattr(train_dataset, "df"):
+        ds_df = train_dataset.df
+    elif hasattr(train_dataset, "dataset") and hasattr(train_dataset.dataset, "df"):
+        ds_df = train_dataset.dataset.df
+    else:
+        ds_df = None
+
+    if ds_df is not None:
+        counts = dict(ds_df["binary_label"].value_counts())
+    else:
+        counts = {0: 1, 1: 1}
+    n_real = max(counts.get(0, 1), 1)
+    n_fake = max(counts.get(1, 1), 1)
+    weight_real = n_fake / (n_real + n_fake) * 2.0
+    weight_fake = n_real / (n_real + n_fake) * 2.0
+    alpha_tensor = torch.tensor([weight_real, weight_fake], dtype=torch.float32).to(device)
+    print(f"[Train] Balanced FocalLoss alpha weights: Real={weight_real:.2f}, Fake={weight_fake:.2f}", flush=True)
     criterion = FocalLoss(gamma=2.0, alpha=alpha_tensor)
-    print("[Train] FocalLoss OK")
+    print("[Train] FocalLoss OK", flush=True)
 
     # Optimizer
-    print("[Train] Creating optimizer...")
+    print("[Train] Creating optimizer...", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
-    print("[Train] Optimizer OK")
+    print("[Train] Optimizer OK", flush=True)
 
     # Scheduler
     scheduler = CosineAnnealingLR(
@@ -266,12 +291,12 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
         T_max=max(config["epochs"] - config["warmup_epochs"], 1),
         eta_min=config["lr_min"],
     )
-    print("[Train] Scheduler OK")
+    print("[Train] Scheduler OK", flush=True)
 
-    # GradScaler — using torch.amp (PyTorch 2.x API, not deprecated torch.cuda.amp)
+    # GradScaler — using torch.amp
     use_amp = device.type == "cuda"
     scaler  = torch.amp.GradScaler(device.type, enabled=use_amp)
-    print(f"[Train] GradScaler OK (AMP enabled: {use_amp})")
+    print(f"[Train] GradScaler OK (AMP enabled: {use_amp})", flush=True)
 
     # Resume
     start_epoch = 0
@@ -283,7 +308,7 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
         if not rp.is_absolute():
             rp = checkpoint_dir / rp
         if rp.exists():
-            print(f"[Train] Resuming from {rp}")
+            print(f"[Train] Resuming from {rp}", flush=True)
             ckpt        = torch.load(rp, map_location=device)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -292,12 +317,15 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
             start_epoch = ckpt["epoch"] + 1
             best_eer    = ckpt.get("best_eer", float("inf"))
             no_improve  = ckpt.get("no_improve", 0)
-            print(f"[Train] Resumed at epoch {start_epoch}, best EER: {best_eer:.4f}")
+            print(f"[Train] Resumed at epoch {start_epoch}, best EER: {best_eer:.4f}", flush=True)
 
     # Training loop
-    print(f"\n{'='*60}")
-    print(f"STARTING TRAINING — {config['epochs']} epochs")
-    print(f"{'='*60}\n")
+    total_batches = len(train_loader)
+    log_interval  = config.get("log_interval", 20)
+
+    print(f"\n{'='*65}", flush=True)
+    print(f"STARTING TRAINING — {config['epochs']} epochs ({total_batches} batches/epoch)", flush=True)
+    print(f"{'='*65}\n", flush=True)
 
     for epoch in range(start_epoch, config["epochs"]):
         epoch_start = time.time()
@@ -309,19 +337,20 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
         epoch_loss = 0.0
         n_correct  = 0
         n_total    = 0
+        batch_timer = time.time()
 
         for batch_idx, (waveforms, labels) in enumerate(train_loader):
             waveforms = waveforms.to(device)
             labels    = labels.to(device)
             optimizer.zero_grad()
 
-            # torch.amp.autocast with explicit device_type (PyTorch 2.x API)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                logits = model(waveforms)
+                out    = model(waveforms)
+                logits = out["logits"]
                 loss   = criterion(logits, labels)
 
             if torch.isnan(loss):
-                print(f"[Train] NaN loss at batch {batch_idx}, skipping.")
+                print(f"[Train] NaN loss at batch {batch_idx}, skipping.", flush=True)
                 continue
 
             scaler.scale(loss).backward()
@@ -335,13 +364,21 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
             n_correct  += (preds == labels).sum().item()
             n_total    += len(labels)
 
-            if (batch_idx + 1) % 100 == 0:
-                pct = 100.0 * (batch_idx + 1) / len(train_loader)
+            if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == total_batches:
+                speed = (batch_idx + 1) / max(time.time() - epoch_start, 1e-3)
+                remaining_batches = total_batches - (batch_idx + 1)
+                eta_seconds = remaining_batches / max(speed, 1e-3)
+                pct = 100.0 * (batch_idx + 1) / total_batches
+
+                cur_loss = epoch_loss / max(n_total, 1)
+                cur_acc  = 100.0 * n_correct / max(n_total, 1)
+
                 print(
-                    f"  Epoch {epoch+1:02d} [{pct:5.1f}%] "
-                    f"loss={epoch_loss/n_total:.4f} "
-                    f"acc={100*n_correct/n_total:.1f}% "
-                    f"lr={get_lr(optimizer):.2e}"
+                    f"  [Epoch {epoch+1:02d}/{config['epochs']}] [{pct:5.1f}%] "
+                    f"({batch_idx+1:4d}/{total_batches}) | "
+                    f"Loss: {cur_loss:.4f} | Acc: {cur_acc:5.1f}% | "
+                    f"Speed: {speed:4.1f} it/s | ETA: {format_time(eta_seconds)}",
+                    flush=True
                 )
 
             if debug and batch_idx >= 1:
@@ -357,10 +394,11 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
 
         epoch_time = time.time() - epoch_start
         print(
-            f"\nEpoch {epoch+1:02d}/{config['epochs']} "
-            f"train_loss={train_loss:.4f} train_acc={100*train_acc:.2f}% "
-            f"val_loss={val_loss:.4f} val_EER={100*val_eer:.2f}% "
-            f"lr={get_lr(optimizer):.2e} time={epoch_time:.0f}s"
+            f"\n>>> Epoch {epoch+1:02d}/{config['epochs']} Summary: "
+            f"Train Loss={train_loss:.4f} | Train Acc={100*train_acc:.2f}% | "
+            f"Val Loss={val_loss:.4f} | Val EER={100*val_eer:.2f}% | "
+            f"LR={get_lr(optimizer):.2e} | Time={format_time(epoch_time)}\n",
+            flush=True
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
@@ -386,27 +424,44 @@ def train(config: dict, resume_path: str = None, debug: bool = False):
             best_eer   = val_eer
             no_improve = 0
             torch.save(ckpt, checkpoint_dir / "best_model.pt")
-            print(f"  [BEST] New best EER: {100*best_eer:.2f}% -- saved best_model.pt")
+            print(f"  [BEST] *** New Best Model Saved! Val EER: {100*best_eer:.2f}% ***\n", flush=True)
         else:
             no_improve += 1
-            print(f"  No improvement ({no_improve}/{config['early_stop_patience']})")
+            print(f"  No improvement ({no_improve}/{config['early_stop_patience']})\n", flush=True)
 
         if no_improve >= config["early_stop_patience"] and not debug:
-            print(f"[Train] Early stopping at epoch {epoch+1}.")
+            print(f"[Train] Early stopping triggered at epoch {epoch+1}.", flush=True)
             break
 
-    print(f"\n{'='*60}")
-    print(f"TRAINING COMPLETE")
+    print(f"\n{'='*65}", flush=True)
+    print("TRAINING COMPLETE")
     print(f"Best validation EER: {100*best_eer:.2f}%")
-    print(f"Best model: {checkpoint_dir / 'best_model.pt'}")
-    print(f"{'='*60}")
-    print(f"Next: py -3.11 eval/evaluate.py --checkpoint checkpoints/best_model.pt")
+    print(f"Best model saved at: {checkpoint_dir / 'best_model.pt'}")
+    print(f"{'='*65}\n", flush=True)
+    print("Next step: py -3.10 export/export_tflite.py --checkpoint checkpoints/best_model.pt", flush=True)
     writer.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TatvaNet")
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--debug",  action="store_true")
+    parser.add_argument("--resume",         type=str, default=None)
+    parser.add_argument("--debug",          action="store_true")
+    parser.add_argument("--train_manifest", type=str, default=None)
+    parser.add_argument("--val_manifest",   type=str, default=None)
+    parser.add_argument("--epochs",         type=int, default=None)
+    parser.add_argument("--batch_size",     type=int, default=None)
+    parser.add_argument("--lr",             type=float, default=None)
+    parser.add_argument("--num_workers",    type=int, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
     args = parser.parse_args()
-    train(CONFIG, resume_path=args.resume, debug=args.debug)
+
+    config = CONFIG.copy()
+    if args.train_manifest: config["train_manifest"] = args.train_manifest
+    if args.val_manifest:   config["val_manifest"]   = args.val_manifest
+    if args.epochs:         config["epochs"]         = args.epochs
+    if args.batch_size:     config["batch_size"]     = args.batch_size
+    if args.lr:             config["lr"]             = args.lr
+    if args.num_workers is not None: config["num_workers"] = args.num_workers
+    if args.checkpoint_dir: config["checkpoint_dir"] = args.checkpoint_dir
+
+    train(config, resume_path=args.resume, debug=args.debug)

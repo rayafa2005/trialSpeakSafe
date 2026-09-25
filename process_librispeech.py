@@ -32,8 +32,8 @@ COLUMNS       = ["path", "label", "dataset", "speaker_id", "duration", "language
 
 TARGET_SR   = 16000
 MIN_DUR     = 1.0
-MAX_DUR     = 4.0
-OVERLAP     = 0.5
+MAX_DUR     = 5.0
+OVERLAP     = 1.0
 
 
 def process():

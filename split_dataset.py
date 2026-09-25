@@ -189,6 +189,31 @@ def print_split_stats(train_rows, val_rows, test_rows):
     print("="*50)
 
 
+def balance_split(rows: list, max_ratio: float = 1.3) -> list:
+    """
+    Balances Real (label=0) and Fake (label>0) by downsampling whichever class is in massive excess.
+    Ensures the training set isn't 90% fake audio.
+    """
+    reals = [r for r in rows if int(r.get("label", 0)) == 0]
+    fakes = [r for r in rows if int(r.get("label", 0)) > 0]
+    if not reals or not fakes:
+        return rows
+    
+    n_r, n_f = len(reals), len(fakes)
+    if n_f > int(n_r * max_ratio):
+        random.shuffle(fakes)
+        fakes = fakes[: int(n_r * max_ratio)]
+        print(f"[Balance] Downsampled fakes from {n_f:,} to {len(fakes):,} to match {n_r:,} reals")
+    elif n_r > int(n_f * max_ratio):
+        random.shuffle(reals)
+        reals = reals[: int(n_f * max_ratio)]
+        print(f"[Balance] Downsampled reals from {n_r:,} to {len(reals):,} to match {n_f:,} fakes")
+        
+    balanced = reals + fakes
+    random.shuffle(balanced)
+    return balanced
+
+
 def write_split(rows: list, path: Path):
     """Write a split manifest CSV."""
     # Shuffle rows within each split for better batch diversity
@@ -211,6 +236,8 @@ def main():
     parser.add_argument("--manifest", type=str, default="data/manifest.csv")
     parser.add_argument("--outdir",   type=str, default="data")
     parser.add_argument("--seed",     type=int, default=RANDOM_SEED)
+    parser.add_argument("--balance",  action="store_true", default=True,
+                        help="Balance Real vs Fake ratio automatically (default: True)")
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -232,6 +259,11 @@ def main():
     # Validate — this is non-negotiable
     verify_no_speaker_leakage(train_rows, val_rows, test_rows)
 
+    # Balance if enabled
+    if args.balance:
+        train_rows = balance_split(train_rows)
+        val_rows   = balance_split(val_rows)
+
     # Stats
     print_split_stats(train_rows, val_rows, test_rows)
 
@@ -241,7 +273,7 @@ def main():
     write_split(test_rows,  out_dir / "test_manifest.csv")
 
     print("\n[DONE] Split complete.")
-    print("Next step: py -3.11 tatvaani_ml/training/train.py")
+    print("Next step: py -3.10 training/train.py")
 
 
 if __name__ == "__main__":

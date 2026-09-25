@@ -50,7 +50,7 @@ class ServerClient {
         //   3. Set: ServerClient.SERVER_URL = "http://192.168.1.42:8000"
         //      (or TatvaaniViewModel.setServerUrl(...) before testing)
         // See tatvaani_android/DEMO_SPRINT.md for OnePlus demo steps.
-        var SERVER_URL = "http://10.12.50.85:8000"
+        var SERVER_URL = "http://172.25.63.85:8000"
 
         private const val ENDPOINT    = "/predict"
         private const val TIMEOUT_SEC = 5L
@@ -140,10 +140,13 @@ class ServerClient {
                 }
             }
 
-            // Same caution rule as on-device (Verdict.fromProbs), not raw server label only
-            val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
-            val verdict = Verdict.fromProbs(probs)
-            val resolvedConfidence = probs[maxIdx]
+            // Trust server's direct calibrated verdict & confidence
+            val verdict = when (verdictStr.lowercase()) {
+                "safe"    -> Verdict.SAFE
+                "danger"  -> Verdict.DANGER
+                else      -> Verdict.CAUTION
+            }
+            val resolvedConfidence = confidence
 
             Log.d(
                 TAG,

@@ -93,8 +93,8 @@ class TFLiteEngine(private val context: Context) {
 
         val startTime = System.currentTimeMillis()
 
-        // Step 0: peak-normalized audio (float32, shape [1, 32000]) — matches spec_features pipeline
-        val targetSamples = FeatureExtractor.SAMPLE_RATE * 2
+        // Step 0: peak-normalized audio (float32, shape [1, 80000]) for 5.0s @ 16kHz
+        val targetSamples = FeatureExtractor.TARGET_SAMPLES
         val audioFloats = featureExtractor.toModelAudio(pcm, targetSamples)
         val audioBuffer = ByteBuffer
             .allocateDirect(audioFloats.size * 4)
@@ -102,49 +102,49 @@ class TFLiteEngine(private val context: Context) {
         audioBuffer.asFloatBuffer().put(audioFloats)
         audioBuffer.rewind()
 
-        // Step 1: Extract features
-        val features = featureExtractor.extract(pcm) ?: run {
-            Log.e(TAG, "Feature extraction failed")
-            return null
-        }
-
-        // Step 2: Build spec_features ByteBuffer (float32, native byte order)
-        val featBuffer = ByteBuffer
-            .allocateDirect(features.size * 4)
-            .order(ByteOrder.nativeOrder())
-        featBuffer.asFloatBuffer().put(features)
-        featBuffer.rewind()
-
-        // Step 3: Output buffer [1, 3]
+        // Output buffer [1, 2] or [1, 3]
         val outputArray = Array(1) { FloatArray(N_CLASSES) }
 
-        // Step 4: Run inference
+        // Step 1: Run inference
         try {
-            val inputs = arrayOf<Any>(audioBuffer, featBuffer)
-            val outputs = hashMapOf<Int, Any>(0 to outputArray)
-            interp.runForMultipleInputsOutputs(inputs, outputs)
+            val inputTensorCount = interp.inputTensorCount
+            if (inputTensorCount == 1) {
+                interp.run(audioBuffer, outputArray)
+            } else {
+                val dummyFeats = FloatArray(9 * 128 * FeatureExtractor.TARGET_FRAMES)
+                val featBuffer = ByteBuffer
+                    .allocateDirect(dummyFeats.size * 4)
+                    .order(ByteOrder.nativeOrder())
+                featBuffer.asFloatBuffer().put(dummyFeats)
+                featBuffer.rewind()
+                val inputs = arrayOf<Any>(audioBuffer, featBuffer)
+                val outputs = hashMapOf<Int, Any>(0 to outputArray)
+                interp.runForMultipleInputsOutputs(inputs, outputs)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Inference failed: ${e.message}")
             return null
         }
 
         val latencyMs = System.currentTimeMillis() - startTime
+        val logits = outputArray[0]
+        
+        val pFake = if (logits.size == 2) {
+            val exp0 = kotlin.math.exp(logits[0].toDouble())
+            val exp1 = kotlin.math.exp(logits[1].toDouble())
+            (exp1 / (exp0 + exp1)).toFloat()
+        } else if (logits.size == 3) {
+            val max = logits.maxOrNull() ?: 0f
+            val exp0 = kotlin.math.exp((logits[0] - max).toDouble())
+            val exp1 = kotlin.math.exp((logits[1] - max).toDouble())
+            val exp2 = kotlin.math.exp((logits[2] - max).toDouble())
+            val sum = exp0 + exp1 + exp2
+            (exp2 / sum).toFloat()
+        } else {
+            (1.0 / (1.0 + kotlin.math.exp(-logits[0].toDouble()))).toFloat()
+        }
 
-        // Step 5: Parse output
-        val probs      = outputArray[0]
-        val verdict    = Verdict.fromProbs(probs)
-        val maxIdx     = probs.indices.maxByOrNull { probs[it] } ?: 0
-        val confidence = probs[maxIdx]
-
-        Log.d(TAG, "Result: $verdict (${(confidence*100).toInt()}%) in ${latencyMs}ms")
-
-        return VerdictResult(
-            verdict    = verdict,
-            confidence = confidence,
-            probs      = probs,
-            latencyMs  = latencyMs,
-            source     = InferenceSource.ON_DEVICE
-        )
+        return Verdict.evaluateProbability(pFake, latencyMs, InferenceSource.ON_DEVICE)
     }
 
     // ── Model loading ─────────────────────────────────────────────────────────

@@ -64,53 +64,70 @@ recent_latencies = deque(maxlen=100)
 
 LABEL_NAMES = {0: "safe", 1: "caution", 2: "danger"}
 
-# Match Android VerdictResult.MIN_CONFIDENCE_FOR_DECISIVE_VERDICT (0.70f)
-CONFIDENCE_THRESHOLD = 0.70
+# Match Android 2.0s baseline (32,000 samples @ 16kHz)
+TARGET_SAMPLES = 32000  # 2.0 seconds at 16kHz
+TARGET_FRAMES = 201     # 1 + 32000 / 160
 
 
-def verdict_from_probs(probs: list[float]) -> tuple[str, float]:
-    """Argmax label; return caution if top probability is below threshold."""
-    idx = int(np.argmax(probs))
-    max_prob = float(probs[idx])
-    if max_prob < CONFIDENCE_THRESHOLD:
-        return "caution", max_prob
-    return LABEL_NAMES[idx], max_prob
-
-# ── Feature extraction (matches Python/Jupyter pipeline) ──────────────────────
-
-def extract_features(audio: np.ndarray, sr: int = 16000):
-    """
-    Build spec_features tensor (1, 9, 128, 201) from raw audio.
-    Matches the librosa pipeline used in training/testing.
-    """
-    # Pad or trim to exactly 32000 samples (2 seconds)
-    if len(audio) < 32000:
-        audio = np.pad(audio, (0, 32000 - len(audio)))
-    else:
-        audio = audio[:32000]
-
+def extract_spec_features(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """Extract 9-channel spectrogram features (1, 9, 128, 201) matching model training."""
     specs = []
     for n_mels in [64, 128, 128]:
         mel = librosa.feature.melspectrogram(
             y=audio, sr=sr, n_mels=n_mels, n_fft=512, hop_length=160
         )
         mel_db = librosa.power_to_db(mel, ref=np.max)
-        mel_db = librosa.util.fix_length(mel_db, size=201, axis=1)
+        mel_db = librosa.util.fix_length(mel_db, size=TARGET_FRAMES, axis=1)
         mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
         if mel_db.shape[0] != 128:
-            mel_db = np.resize(mel_db, (128, 201))
+            mel_db = np.resize(mel_db, (128, TARGET_FRAMES))
         specs.append(mel_db)
 
-    # Delta and delta-delta
     for i in range(3):
         specs.append(librosa.feature.delta(specs[i]))
     for i in range(3):
         specs.append(librosa.feature.delta(specs[i], order=2))
 
-    spec_tensor = np.stack(specs)[np.newaxis].astype(np.float32)  # (1, 9, 128, 201)
-    audio_tensor = audio[np.newaxis].astype(np.float32)            # (1, 32000)
+    return np.stack(specs)[np.newaxis].astype(np.float32)
 
-    return audio_tensor, spec_tensor
+
+def verdict_from_prob(p_fake: float) -> tuple[str, float, list[float]]:
+    """
+    Compute calibrated continuous 3-tier verdict from deepfake probability.
+      p_fake < 0.35           -> SAFE (Genuine Human)
+      0.35 <= p_fake <= 0.65  -> CAUTION (Uncertain)
+      p_fake > 0.65           -> DANGER (AI Generated)
+    """
+    if p_fake < 0.35:
+        verdict = "safe"
+        confidence = 1.0 - p_fake
+    elif p_fake > 0.65:
+        verdict = "danger"
+        confidence = p_fake
+    else:
+        verdict = "caution"
+        confidence = 1.0 - abs(p_fake - 0.5) * 2.0
+
+    p_safe_raw = max(0.0, 1.0 - p_fake / 0.5)
+    p_danger_raw = max(0.0, (p_fake - 0.5) / 0.5)
+    p_caution_raw = max(0.0, 1.0 - 2.0 * abs(p_fake - 0.5))
+    total = p_safe_raw + p_caution_raw + p_danger_raw + 1e-8
+    probs = [p_safe_raw / total, p_caution_raw / total, p_danger_raw / total]
+
+    return verdict, float(confidence), probs
+
+
+def prepare_audio_tensor(audio: np.ndarray) -> np.ndarray:
+    """Pad or trim audio to exactly TARGET_SAMPLES (2.0s @ 16kHz)."""
+    if len(audio) < TARGET_SAMPLES:
+        audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)))
+    else:
+        audio = audio[:TARGET_SAMPLES]
+    # Peak normalize
+    peak = np.abs(audio).max()
+    if peak > 1e-6:
+        audio = audio / peak
+    return audio[np.newaxis].astype(np.float32)  # (1, 32000)
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
@@ -118,7 +135,6 @@ def extract_features(audio: np.ndarray, sr: int = 16000):
 async def load_model():
     global session
 
-    # Look for ONNX model in common locations
     candidates = [
         Path("tatvaani_android/app/src/main/assets/tatvanet.onnx"),
         Path("export/tatvanet.onnx"),
@@ -206,22 +222,41 @@ async def predict(request: PredictRequest):
         log.warning("Model not loaded — returning mock response")
         return PredictResponse(
             verdict    = "caution",
-            confidence = 0.60,
-            probs      = [0.25, 0.60, 0.15],
+            confidence = 0.50,
+            probs      = [0.25, 0.50, 0.25],
             latency_ms = elapsed_ms
         )
 
     # Run inference
     try:
-        audio_tensor, spec_tensor = extract_features(audio)
+        audio_tensor = prepare_audio_tensor(audio)
+        input_names = [i.name for i in session.get_inputs()]
+        
+        feed = {"audio": audio_tensor}
+        # Backward compatibility if ONNX expects legacy spec_features input
+        if "spec_features" in input_names:
+            try:
+                spec_tensor = extract_spec_features(audio_tensor[0])
+            except Exception as e:
+                log.warning(f"Feature extraction failed, using dummy zeros: {e}")
+                spec_tensor = np.zeros((1, 9, 128, TARGET_FRAMES), dtype=np.float32)
+            feed["spec_features"] = spec_tensor
 
-        logits = session.run(None, {
-            "audio":         audio_tensor,
-            "spec_features": spec_tensor
-        })[0][0]
+        outputs = session.run(None, feed)
+        logits = outputs[0][0]
 
-        probs = scipy.special.softmax(logits).tolist()
-        verdict_str, confidence = verdict_from_probs(probs)
+        # Calculate continuous probability of fake
+        if len(logits) == 2:
+            exp_logits = np.exp(logits - np.max(logits))
+            p_fake = float(exp_logits[1] / np.sum(exp_logits))
+        elif len(logits) == 3:
+            exp_logits = np.exp(logits - np.max(logits))
+            probs_3 = exp_logits / np.sum(exp_logits)
+            p_fake = float(probs_3[2])
+        else:
+            p_fake = float(1.0 / (1.0 + np.exp(-logits[0])))
+
+        verdict_str, confidence, probs = verdict_from_prob(p_fake)
 
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         recent_latencies.append(elapsed_ms)
@@ -229,7 +264,7 @@ async def predict(request: PredictRequest):
         log.info(
             f"Verdict: {verdict_str} ({confidence*100:.1f}%) "
             f"in {elapsed_ms}ms | "
-            f"probs: safe={probs[0]:.3f} caution={probs[1]:.3f} danger={probs[2]:.3f}"
+            f"probs: safe={probs[0]:.3f} caution={probs[1]:.3f} danger={probs[2]:.3f} (p_fake={p_fake:.3f})"
         )
 
         return PredictResponse(

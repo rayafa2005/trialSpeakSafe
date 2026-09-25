@@ -53,12 +53,36 @@ enum class Verdict(
             else -> CAUTION
         }
 
-        /** Argmax class unless top probability is below [MIN_CONFIDENCE_FOR_DECISIVE_VERDICT] → CAUTION */
+        /** Continuous 3-tier calibration from deepfake probability */
+        fun evaluateProbability(
+            pFake: Float,
+            latencyMs: Long,
+            source: InferenceSource
+        ): VerdictResult {
+            val (verdict, confidence) = when {
+                pFake < 0.35f -> SAFE to (1.0f - pFake)
+                pFake > 0.65f -> DANGER to pFake
+                else -> CAUTION to (1.0f - kotlin.math.abs(pFake - 0.50f) * 2.0f)
+            }
+            val pSafeRaw = maxOf(0.0f, 1.0f - pFake / 0.5f)
+            val pDangerRaw = maxOf(0.0f, (pFake - 0.5f) / 0.5f)
+            val pCautionRaw = maxOf(0.0f, 1.0f - 2.0f * kotlin.math.abs(pFake - 0.5f))
+            val total = pSafeRaw + pCautionRaw + pDangerRaw + 1e-8f
+            val probs = floatArrayOf(pSafeRaw / total, pCautionRaw / total, pDangerRaw / total)
+
+            return VerdictResult(
+                verdict = verdict,
+                confidence = confidence,
+                probs = probs,
+                latencyMs = latencyMs,
+                source = source
+            )
+        }
+
+        /** Argmax class selection without threshold gating */
         fun fromProbs(probs: FloatArray): Verdict {
             require(probs.size == 3) { "Expected 3 class probabilities, got ${probs.size}" }
             val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
-            val maxProb = probs[maxIdx]
-            if (maxProb < MIN_CONFIDENCE_FOR_DECISIVE_VERDICT) return CAUTION
             return fromIndex(maxIdx)
         }
 
@@ -73,15 +97,13 @@ enum class Verdict(
 
         /**
          * Choose which pipeline drives the main result UI when both ran.
-         * No fixed on-device/server priority — uses [VerdictResult.decisionStrength].
+         * Prioritizes the SERVER verdict if available; falls back to on-device when server is null.
          */
         fun pickPrimaryForDisplay(
             onDevice: VerdictResult?,
             server: VerdictResult?
         ): VerdictResult? {
-            val candidates = listOfNotNull(onDevice, server)
-            if (candidates.isEmpty()) return null
-            return candidates.maxByOrNull { it.decisionStrength() }
+            return server ?: onDevice
         }
     }
 }

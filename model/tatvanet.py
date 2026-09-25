@@ -396,7 +396,7 @@ class TatvaNet(nn.Module):
         self,
         sample_rate: int = 16000,
         gru_hidden:  int = 128,
-        n_classes:   int = 3,
+        n_classes:   int = 2,
         dropout:     float = 0.3
     ):
         super().__init__()
@@ -407,30 +407,30 @@ class TatvaNet(nn.Module):
         # Path A: raw waveform
         self.path_a = PathA_SincCNN(sample_rate=sample_rate)
 
-        # Path B: 9-channel spectrogram (import here to avoid circular)
+        # Path B: 9-channel spectrogram
         self.path_b = PathB_SpecCNN()
 
-        # Path B feature pipeline (spectrogram + delta)
-        # Imported lazily to avoid import issues during unit test
-        self._feature_pipeline = None
+        # Path B feature pipeline (spectrogram + delta) embedded directly
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from features.delta import FeaturePipeline
+        self.feature_pipeline = FeaturePipeline(sample_rate=sample_rate)
 
         # ── Fusion ────────────────────────────────────────────────────
         self.fusion = CrossAttentionFusion(embed_dim=256, n_heads=4)
 
         # ── Temporal modeling ─────────────────────────────────────────
-        # GRU captures temporal dependencies across the full audio buffer
-        # Input: fused embedding (256) treated as single timestep
-        # In practice, we can pass multiple overlapping windows to GRU
         self.gru = nn.GRU(
             input_size=256,
             hidden_size=gru_hidden,
             num_layers=1,
             batch_first=True,
             bidirectional=False,
-            dropout=0.0  # No dropout on single-layer GRU
+            dropout=0.0
         )
 
         # ── Classifier ────────────────────────────────────────────────
+        # Default 2-class binary classifier (0=Safe/Real, 1=Danger/Fake)
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(gru_hidden, 64),
@@ -461,17 +461,6 @@ class TatvaNet(nn.Module):
                     elif "bias" in name:
                         nn.init.zeros_(param)
 
-    def _get_feature_pipeline(self, device):
-        """Lazy-load feature pipeline to avoid circular imports at module level."""
-        if self._feature_pipeline is None:
-            import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-            from features.delta import FeaturePipeline
-            self._feature_pipeline = FeaturePipeline(
-                sample_rate=self.sample_rate
-            ).to(device)
-        return self._feature_pipeline
-
     def forward(
         self,
         x: torch.Tensor,
@@ -481,27 +470,31 @@ class TatvaNet(nn.Module):
         Forward pass through TatvaNet.
         
         Args:
-            x             : (batch, samples) — raw PCM waveform
-            spec_features : (batch, 9, 128, T) — pre-computed spectrogram
-                            features. If None, computed on the fly.
-                            Pre-computing is faster when doing multiple
-                            forward passes on the same audio.
+            x             : (batch, samples) — raw PCM waveform (e.g. 80,000 samples for 5.0s @ 16kHz)
+            spec_features : (batch, 9, 128, T) — optional pre-computed spectrogram features
         
         Returns:
             dict with keys:
-              'logits'      : (batch, 3) — raw classifier output
-              'probs'       : (batch, 3) — softmax probabilities
-              'verdict'     : (batch,)   — predicted class index
-              'confidence'  : (batch,)   — probability of predicted class
+              'logits'      : (batch, 2) — raw 2-class logits (Safe=0, Danger=1)
+              'probs'       : (batch, 3) — calibrated 3-class probabilities [Safe, Caution, Danger]
+              'verdict'     : (batch,)   — predicted class index (0=Safe, 1=Caution, 2=Danger)
+              'confidence'  : (batch,)   — confidence of predicted verdict [0.0, 1.0]
+              'p_fake'      : (batch,)   — continuous probability of deepfake [0.0, 1.0]
         """
+        # Ensure 2D (batch, samples) for audio input
+        if x.dim() == 3 and x.shape[1] == 1:
+            x_2d = x.squeeze(1)
+        elif x.dim() == 1:
+            x_2d = x.unsqueeze(0)
+        else:
+            x_2d = x
+
         # ── Path A: raw waveform ───────────────────────────────────────
-        x = x.view(x.shape[0], 1, -1)  # ensure [B, 1, N] for sinc_conv (fixes 4D input bug)
-        emb_a = self.path_a(x)          # (batch, 256)
+        emb_a = self.path_a(x_2d)          # (batch, 256)
 
         # ── Path B: 9-channel spectrogram ──────────────────────────────
         if spec_features is None:
-            pipeline = self._get_feature_pipeline(x.device)
-            spec_features = pipeline(x)  # (batch, 9, 128, T)
+            spec_features = self.feature_pipeline(x_2d)  # (batch, 9, 128, T)
 
         emb_b = self.path_b(spec_features)  # (batch, 256)
 
@@ -509,22 +502,64 @@ class TatvaNet(nn.Module):
         fused = self.fusion(emb_a, emb_b)   # (batch, 256)
 
         # ── GRU temporal modeling ──────────────────────────────────────
-        # Treat fused embedding as single timestep sequence
         gru_out, _ = self.gru(fused.unsqueeze(1))  # (batch, 1, 128)
         gru_out = gru_out.squeeze(1)               # (batch, 128)
 
         # ── Classification ─────────────────────────────────────────────
-        logits = self.classifier(gru_out)  # (batch, 3)
-        probs  = F.softmax(logits, dim=-1) # (batch, 3)
+        logits = self.classifier(gru_out)  # (batch, n_classes)
 
-        verdict    = probs.argmax(dim=-1)                         # (batch,)
-        confidence = probs.gather(1, verdict.unsqueeze(1)).squeeze(1)  # (batch,)
+        if self.n_classes == 2:
+            binary_probs = F.softmax(logits, dim=-1)  # (batch, 2)
+            p_fake = binary_probs[:, 1]               # (batch,)
+            
+            # Calibrated 3-tier probability distribution
+            # Safe: high when p_fake < 0.35
+            # Danger: high when p_fake > 0.65
+            # Caution: high when 0.35 <= p_fake <= 0.65
+            p_safe_raw = torch.clamp(1.0 - p_fake / 0.5, min=0.0, max=1.0)
+            p_danger_raw = torch.clamp((p_fake - 0.5) / 0.5, min=0.0, max=1.0)
+            p_caution_raw = torch.clamp(1.0 - 2.0 * (p_fake - 0.5).abs(), min=0.0, max=1.0)
+            
+            p_sum = p_safe_raw + p_caution_raw + p_danger_raw + 1e-8
+            probs = torch.stack([
+                p_safe_raw / p_sum,
+                p_caution_raw / p_sum,
+                p_danger_raw / p_sum
+            ], dim=-1)  # (batch, 3)
+
+            # Continuous verdict assignment
+            verdict = torch.where(
+                p_fake < 0.35,
+                torch.zeros_like(p_fake, dtype=torch.long),
+                torch.where(
+                    p_fake > 0.65,
+                    torch.full_like(p_fake, 2, dtype=torch.long),
+                    torch.ones_like(p_fake, dtype=torch.long)
+                )
+            )
+
+            # Continuous confidence
+            confidence = torch.where(
+                p_fake < 0.35,
+                1.0 - p_fake,
+                torch.where(
+                    p_fake > 0.65,
+                    p_fake,
+                    1.0 - (p_fake - 0.5).abs() * 2.0
+                )
+            )
+        else:
+            probs = F.softmax(logits, dim=-1)
+            verdict = probs.argmax(dim=-1)
+            confidence = probs.gather(1, verdict.unsqueeze(1)).squeeze(1)
+            p_fake = probs[:, -1]
 
         return {
             "logits":     logits,
             "probs":      probs,
             "verdict":    verdict,
             "confidence": confidence,
+            "p_fake":     p_fake,
         }
 
     def predict(self, x: torch.Tensor) -> tuple:
@@ -581,7 +616,7 @@ if __name__ == "__main__":
     print(f"  Confidence:       {out['confidence'].tolist()}")
 
     # Shape checks
-    assert out["logits"].shape     == (batch, 3), f"Logits wrong: {out['logits'].shape}"
+    assert out["logits"].shape     == (batch, model.n_classes), f"Logits wrong: {out['logits'].shape}"
     assert out["probs"].shape      == (batch, 3), f"Probs wrong:  {out['probs'].shape}"
     assert out["verdict"].shape    == (batch,),   f"Verdict wrong:{out['verdict'].shape}"
     assert out["confidence"].shape == (batch,),   f"Conf wrong:   {out['confidence'].shape}"

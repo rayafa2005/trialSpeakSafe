@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and training runs
+runs/
+*.tfevents.*
+
+# Large audio data files (raw & processed audio)
+data/raw/
+data/processed/
+*.flac
+*.wav
+*.mp3
+*.ogg
+
+# Temporary test exports
+export/test_*.onnx
+export/out.txt
+
+# Android build outputs & local caches
+tatvaani_android/app/build/
+tatvaani_android/.gradle/
+tatvaani_android/local.properties
+tatvaani_android/.idea/
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db

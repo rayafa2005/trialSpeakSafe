@@ -76,66 +76,62 @@ class OnnxEngine(private val context: Context) {
             return null
         }
 
+        //val start = System.currentTimeMillis()
+
         val start = System.currentTimeMillis()
 
-        // Input 1: peak-normalized waveform (1, 32000) — must match spec_features pipeline
-        val targetSamples = FeatureExtractor.SAMPLE_RATE * 2
+        // Input: peak-normalized waveform (1, 32000) for 2.0s @ 16kHz
+        val targetSamples = FeatureExtractor.TARGET_SAMPLES
         val audio = featureExtractor.toModelAudio(pcm, targetSamples)
-
-        // Input 2: spec_features from Kotlin pipeline (flattened [9*128*T])
-        val featsFlat = featureExtractor.extract(pcm) ?: run {
-            Log.e(TAG, "Feature extraction failed")
-            return null
-        }
-        val tFrames = featsFlat.size / (9 * 128)
-        if (tFrames <= 0) {
-            Log.e(TAG, "Invalid feature shape: ${featsFlat.size}")
-            return null
-        }
 
         val audioTensor = OnnxTensor.createTensor(
             e,
             FloatBuffer.wrap(audio),
             longArrayOf(1, targetSamples.toLong())
         )
-        val featTensor = OnnxTensor.createTensor(
-            e,
-            FloatBuffer.wrap(featsFlat),
-            longArrayOf(1, 9, 128, tFrames.toLong())
-        )
+
+        var featTensor: OnnxTensor? = null
 
         try {
-            val inputs = mapOf(
-                "audio" to audioTensor,
-                "spec_features" to featTensor
-            )
+            val inputNames = s.inputNames
+            val inputs = mutableMapOf<String, OnnxTensor>("audio" to audioTensor)
+
+            // Backward compatibility if ONNX expects legacy spec_features input
+            if (inputNames.contains("spec_features")) {
+                val feats = featureExtractor.extract(pcm)
+                    ?: FloatArray(9 * 128 * FeatureExtractor.TARGET_FRAMES)
+                featTensor = OnnxTensor.createTensor(
+                    e,
+                    FloatBuffer.wrap(feats),
+                    longArrayOf(1, 9, 128, FeatureExtractor.TARGET_FRAMES.toLong())
+                )
+                inputs["spec_features"] = featTensor
+            }
+
             s.run(inputs).use { results ->
                 val logitsAny = results[0].value
-                val logits = (logitsAny as Array<FloatArray>)[0] // (1,3) -> [3]
-                val probs = softmax(logits)
-                val verdict = Verdict.fromProbs(probs)
-                val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
-                val conf = probs[maxIdx]
-                Log.d(
-                    TAG,
-                    "probs safe=${"%.3f".format(probs[0])} caution=${"%.3f".format(probs[1])} " +
-                            "danger=${"%.3f".format(probs[2])} -> $verdict (${(conf * 100).toInt()}%)"
-                )
+                val logits = (logitsAny as Array<FloatArray>)[0] // (1, 2) or (1, 3)
+                
+                val pFake = if (logits.size == 2) {
+                    val exp0 = kotlin.math.exp(logits[0].toDouble())
+                    val exp1 = kotlin.math.exp(logits[1].toDouble())
+                    (exp1 / (exp0 + exp1)).toFloat()
+                } else if (logits.size == 3) {
+                    val probs = softmax(logits)
+                    probs[2]
+                } else {
+                    (1.0 / (1.0 + kotlin.math.exp(-logits[0].toDouble()))).toFloat()
+                }
+
                 val latency = System.currentTimeMillis() - start
-                return VerdictResult(
-                    verdict = verdict,
-                    confidence = conf,
-                    probs = probs,
-                    latencyMs = latency,
-                    source = InferenceSource.ON_DEVICE
-                )
+                return Verdict.evaluateProbability(pFake, latency, InferenceSource.ON_DEVICE)
             }
         } catch (ex: Exception) {
             Log.e(TAG, "ONNX inference failed: ${ex.message}")
             return null
         } finally {
             audioTensor.close()
-            featTensor.close()
+            featTensor?.close()
         }
     }
 

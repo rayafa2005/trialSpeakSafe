@@ -37,9 +37,9 @@ warnings.filterwarnings("ignore")
 TARGET_SR       = 16000       # All audio resampled to 16kHz
 TARGET_CHANNELS = 1           # Mono
 MIN_DURATION    = 1.0         # Discard clips shorter than 1 second
-MAX_DURATION    = 4.0         # Split clips longer than 4 seconds
-SPLIT_HOP       = 2.0         # Hop size when splitting long clips (seconds)
-SPLIT_LEN       = 2.0         # Length of each split segment (seconds)
+MAX_DURATION    = 5.0         # Split clips longer than 5 seconds
+SPLIT_HOP       = 2.5         # Hop size when splitting long clips (seconds)
+SPLIT_LEN       = 5.0         # Length of each split segment (seconds)
 OUTPUT_DIR      = Path("data/processed")
 MANIFEST_PATH   = Path("data/manifest.csv")
 
@@ -460,6 +460,125 @@ def process_public_collected(input_dir: Path, manifest_rows: list):
     print(f"  [Public Collected] Done: {count} files processed")
 
 
+def process_mlaad(input_dir: Path, manifest_rows: list):
+    """
+    MLAAD / MLAAD-tiny dataset processor.
+    Structure:
+      MLAAD-tiny/
+        original/
+          de/*.wav (bonafide)
+          en/*.wav (bonafide)
+        fake/
+          de/<model_name>/*.wav (spoof)
+          en/<model_name>/*.wav (spoof)
+    """
+    print("\n[MLAAD] Processing...")
+    count = 0
+    existing_paths = {r["path"] for r in manifest_rows}
+
+    # 1. Process original (bonafide, Safe, label=0)
+    orig_dir = input_dir / "original"
+    if orig_dir.exists():
+        for lang_dir in orig_dir.iterdir():
+            if not lang_dir.is_dir():
+                continue
+            lang = lang_dir.name
+            for wav_path in lang_dir.rglob("*.wav"):
+                stem = wav_path.stem
+                spk = stem.split("_")[0] if "_" in stem else "spk"
+                rows = process_single_file(
+                    in_path=wav_path,
+                    out_path=wav_path,
+                    label=0,  # bonafide / Safe
+                    dataset="mlaad",
+                    speaker_id=f"mlaad_{lang}_{spk}",
+                    language=lang,
+                    gender="unknown"
+                )
+                for r in rows:
+                    if r["path"] not in existing_paths:
+                        manifest_rows.append(r)
+                        existing_paths.add(r["path"])
+                count += 1
+
+    # 2. Process fake (synthetic, Danger, label=2)
+    fake_dir = input_dir / "fake"
+    if fake_dir.exists():
+        for lang_dir in fake_dir.iterdir():
+            if not lang_dir.is_dir():
+                continue
+            lang = lang_dir.name
+            for model_dir in lang_dir.iterdir():
+                if not model_dir.is_dir():
+                    continue
+                model_name = model_dir.name
+                for wav_path in model_dir.rglob("*.wav"):
+                    stem = wav_path.stem
+                    spk = stem.split("_")[0] if "_" in stem else "fake"
+                    rows = process_single_file(
+                        in_path=wav_path,
+                        out_path=wav_path,
+                        label=2,  # spoof / Danger
+                        dataset="mlaad",
+                        speaker_id=f"mlaad_{model_name}_{lang}_{spk}",
+                        language=lang,
+                        gender="unknown"
+                    )
+                    for r in rows:
+                        if r["path"] not in existing_paths:
+                            manifest_rows.append(r)
+                            existing_paths.add(r["path"])
+                    count += 1
+
+    print(f"  [MLAAD] Done: {count} files processed → segments added to manifest")
+
+
+def process_librispeech_dataset(input_dir: Path, manifest_rows: list):
+    """
+    LibriSpeech train-clean-100 processor.
+    Structure:
+      LibriSpeech/
+        train-clean-100/
+          <speaker_id>/<chapter_id>/*.flac
+    """
+    print("\n[LibriSpeech] Processing...")
+    src = input_dir / "train-clean-100" if (input_dir / "train-clean-100").exists() else input_dir
+    flac_files = list(src.rglob("*.flac"))
+    print(f"  Found {len(flac_files):,} FLAC files in LibriSpeech")
+
+    existing_paths = {r["path"] for r in manifest_rows}
+    count = 0
+    for flac in flac_files:
+        spk_id = f"libri_{flac.parent.parent.name}" if flac.parent.parent.name.isdigit() else f"libri_{flac.parent.name}"
+        rows = process_single_file(
+            in_path=flac,
+            out_path=flac,
+            label=0,  # bonafide / Safe
+            dataset="librispeech",
+            speaker_id=spk_id,
+            language="en",
+            gender="unknown"
+        )
+        for r in rows:
+            if r["path"] not in existing_paths:
+                manifest_rows.append(r)
+                existing_paths.add(r["path"])
+        count += 1
+        if count % 2000 == 0:
+            print(f"  [LibriSpeech] Processed {count}/{len(flac_files)} files...")
+
+    print(f"  [LibriSpeech] Done: {count} files processed")
+
+
+def find_dir(candidates: list) -> Path:
+    """Find the first existing directory among candidate paths."""
+    for c in candidates:
+        p = Path(c)
+        if p.exists():
+            return p
+    return None
+
+
 # ─── Manifest writer ──────────────────────────────────────────────────────────
 
 def write_manifest(rows: list, path: Path):
@@ -487,7 +606,7 @@ def print_stats(rows: list):
     print(f"Total segments: {len(rows)}")
     print(f"\nLabel distribution:")
     for k, v in sorted(labels.items()):
-        name = {0: "Safe/bonafide", 1: "Caution/half-truth", 2: "Danger/spoof"}[k]
+        name = {0: "Safe/bonafide", 1: "Caution/half-truth", 2: "Danger/spoof"}.get(int(k), str(k))
         print(f"  {name}: {v} ({100*v/len(rows):.1f}%)")
     print(f"\nDataset distribution:")
     for k, v in datasets.most_common():
@@ -505,8 +624,10 @@ def print_stats(rows: list):
 
 def main():
     parser = argparse.ArgumentParser(description="Tatvaani Dataset Processor")
+    parser.add_argument("--all", action="store_true",
+        help="Process all available datasets found in data/raw/")
     parser.add_argument("--dataset", choices=[
-        "asvspoof", "wavefake", "indicsynth", "public_collected", "all"
+        "asvspoof", "mlaad", "librispeech", "wavefake", "indicsynth", "public_collected", "all"
     ], default="all")
     parser.add_argument("--input",  type=str, default=None,
         help="Input directory for single dataset mode")
@@ -526,43 +647,83 @@ def main():
 
     # Load existing manifest if it exists (allows incremental processing)
     if MANIFEST_PATH.exists():
-        with open(MANIFEST_PATH, "r") as f:
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             manifest_rows = list(reader)
         print(f"[Manifest] Loaded {len(manifest_rows)} existing entries.")
 
-    if args.dataset == "all" or args.dataset == "asvspoof":
-        p = Path(args.input) if args.input else Path("data/raw/ASVspoof2019_LA")
-        if p.exists():
+    process_all = args.all or args.dataset == "all"
+
+    # 1. ASVspoof 2019 LA
+    if process_all or args.dataset == "asvspoof":
+        p = Path(args.input) if args.input else find_dir([
+            "data/raw/LA",
+            "data/raw/ASVspoof2019_LA",
+            "data/raw/ASV2019",
+        ])
+        if p and p.exists():
             process_asvspoof(p, manifest_rows)
         else:
-            print(f"[SKIP] ASVspoof not found at {p}")
+            if not process_all:
+                print(f"[SKIP] ASVspoof not found at {p}")
 
-    if args.dataset == "all" or args.dataset == "wavefake":
-        p = Path(args.input) if args.input else Path("data/raw/WaveFake")
-        if p.exists():
+    # 2. MLAAD
+    if process_all or args.dataset == "mlaad":
+        p = Path(args.input) if args.input else find_dir([
+            "data/raw/MLAAD-tiny",
+            "data/raw/MLAAD",
+            "data/raw/mlaad-tiny",
+            "data/raw/mlaad",
+        ])
+        if p and p.exists():
+            process_mlaad(p, manifest_rows)
+        else:
+            if not process_all:
+                print(f"[SKIP] MLAAD not found at {p}")
+
+    # 3. LibriSpeech
+    if process_all or args.dataset == "librispeech":
+        p = Path(args.input) if args.input else find_dir([
+            "data/raw/LibriSpeech/train-clean-100",
+            "data/raw/LibriSpeech",
+        ])
+        if p and p.exists():
+            process_librispeech_dataset(p, manifest_rows)
+        else:
+            if not process_all:
+                print(f"[SKIP] LibriSpeech not found at {p}")
+
+    # 4. WaveFake
+    if process_all or args.dataset == "wavefake":
+        p = Path(args.input) if args.input else find_dir(["data/raw/WaveFake"])
+        if p and p.exists():
             process_wavefake(p, manifest_rows)
         else:
-            print(f"[SKIP] WaveFake not found at {p}")
+            if not process_all:
+                print(f"[SKIP] WaveFake not found at {p}")
 
-    if args.dataset == "all" or args.dataset == "indicsynth":
-        p = Path(args.input) if args.input else Path("data/raw/IndicSynth")
-        if p.exists():
+    # 5. IndicSynth
+    if process_all or args.dataset == "indicsynth":
+        p = Path(args.input) if args.input else find_dir(["data/raw/IndicSynth"])
+        if p and p.exists():
             process_indicsynth(p, manifest_rows)
         else:
-            print(f"[SKIP] IndicSynth not found at {p}")
+            if not process_all:
+                print(f"[SKIP] IndicSynth not found at {p}")
 
-    if args.dataset == "all" or args.dataset == "public_collected":
-        p = Path(args.input) if args.input else Path("data/raw/public_collected")
-        if p.exists():
+    # 6. Public Collected
+    if process_all or args.dataset == "public_collected":
+        p = Path(args.input) if args.input else find_dir(["data/raw/public_collected"])
+        if p and p.exists():
             process_public_collected(p, manifest_rows)
         else:
-            print(f"[SKIP] public_collected not found at {p} (expected later)")
+            if not process_all:
+                print(f"[SKIP] public_collected not found at {p}")
 
     write_manifest(manifest_rows, MANIFEST_PATH)
     print_stats(manifest_rows)
     print("\n[DONE] Dataset processing complete.")
-    print(f"Next step: py -3.11 split_dataset.py")
+    print("Next step: py -3.10 split_dataset.py --balance")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ def get_args():
     parser.add_argument("--output_dir",   default="export")
     parser.add_argument("--sample_rate",  type=int, default=SAMPLE_RATE)
     parser.add_argument("--clip_duration",type=float, default=2.0,
-                        help="Input clip duration in seconds. Must match training.")
+                        help="Input clip duration in seconds (2.0s @ 16kHz = 32,000 samples).")
     parser.add_argument("--calib_manifest", default="data/train_manifest.csv",
                         help="Manifest for INT8 calibration samples")
     parser.add_argument("--n_calib",      type=int, default=200,
@@ -65,7 +65,7 @@ def get_args():
 
 def load_model(checkpoint_path: str, device: torch.device) -> TatvaNet:
     """Load TatvaNet from checkpoint and set to eval mode."""
-    model = TatvaNet(sample_rate=SAMPLE_RATE).to(device)
+    model = TatvaNet(sample_rate=SAMPLE_RATE, n_classes=2).to(device)
     ckpt  = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -85,9 +85,8 @@ def export_onnx(
     """
     Export TatvaNet to ONNX format.
 
-    ONNX is an intermediate format that bridges PyTorch and TFLite.
-    We export with dynamic batch size so the model works for both
-    batch inference (server) and single-sample inference (Android).
+    Single input: audio (batch_size, clip_samples) = (batch, 80000).
+    Feature extraction (Mel, STFT, CQT, Delta) runs inside the ONNX graph.
 
     Returns: path to saved .onnx file
     """
@@ -95,12 +94,8 @@ def export_onnx(
 
     print(f"\n[Export] Exporting to ONNX...")
 
-    # Representative input: (1, clip_samples) — single sample, mono audio
+    # Representative input: (1, clip_samples) — 5.0s mono audio
     dummy_input = torch.randn(1, clip_samples).to(device)
-
-    # Disable feature pipeline lazy init by running a warmup pass
-    with torch.no_grad():
-        _ = model(dummy_input)
 
     # Export with dynamic axes so batch size is flexible
     torch.onnx.export(
@@ -108,8 +103,8 @@ def export_onnx(
         dummy_input,
         output_path,
         export_params=True,
-        opset_version=12,          # Opset 12 has good TFLite converter support
-        do_constant_folding=True,  # Fold constant ops for smaller model
+        opset_version=17,          # Opset 17 supports STFT and modern audio ops
+        do_constant_folding=True,
         input_names=["audio"],
         output_names=["logits"],
         dynamic_axes={
