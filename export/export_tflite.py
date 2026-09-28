@@ -67,7 +67,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> TatvaNet:
     """Load TatvaNet from checkpoint and set to eval mode."""
     model = TatvaNet(sample_rate=SAMPLE_RATE, n_classes=2).to(device)
     ckpt  = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
     print(f"[Export] Model loaded from {checkpoint_path}")
     print(f"[Export] Parameters: {model.count_parameters():,}")

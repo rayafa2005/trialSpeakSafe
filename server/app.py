@@ -131,20 +131,45 @@ def prepare_audio_tensor(audio: np.ndarray) -> np.ndarray:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
+torch_model = None
+
 @app.on_event("startup")
 async def load_model():
-    global session
+    global session, torch_model
 
+    # 1. Check for PyTorch Checkpoint (.pt / .pth)
+    pt_candidates = [
+        Path("checkpoints/best_model.pt"),
+        Path("checkpoints/best_tatvanet.pt"),
+        Path("best_model.pt"),
+    ]
+    pt_path = next((p for p in pt_candidates if p.exists()), None)
+    if pt_path is not None:
+        try:
+            import torch
+            from model.tatvanet import TatvaNet
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            m = TatvaNet(sample_rate=16000, n_classes=2).to(device)
+            ckpt = torch.load(pt_path, map_location=device)
+            state = ckpt.get("model_state", ckpt)
+            m.load_state_dict(state, strict=False)
+            m.eval()
+            torch_model = m
+            log.info(f"PyTorch model loaded successfully from {pt_path} on {device}")
+            return
+        except Exception as e:
+            log.warning(f"Could not load PyTorch checkpoint ({e}). Falling back to ONNX...")
+
+    # 2. Check for ONNX Model
     candidates = [
         Path("tatvaani_android/app/src/main/assets/tatvanet.onnx"),
         Path("export/tatvanet.onnx"),
         Path("tatvanet.onnx"),
     ]
-
     model_path = next((p for p in candidates if p.exists()), None)
 
     if model_path is None:
-        log.warning("No ONNX model found — /predict will return mock response")
+        log.warning("No ONNX or PyTorch model found — /predict will return mock response")
         return
 
     try:
@@ -217,7 +242,7 @@ async def predict(request: PredictRequest):
     log.info(f"Received {len(audio)} samples ({len(audio)/16000:.2f}s)")
 
     # Mock response if model not loaded
-    if session is None:
+    if session is None and torch_model is None:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         log.warning("Model not loaded — returning mock response")
         return PredictResponse(
@@ -229,21 +254,28 @@ async def predict(request: PredictRequest):
 
     # Run inference
     try:
-        audio_tensor = prepare_audio_tensor(audio)
-        input_names = [i.name for i in session.get_inputs()]
-        
-        feed = {"audio": audio_tensor}
-        # Backward compatibility if ONNX expects legacy spec_features input
-        if "spec_features" in input_names:
-            try:
-                spec_tensor = extract_spec_features(audio_tensor[0])
-            except Exception as e:
-                log.warning(f"Feature extraction failed, using dummy zeros: {e}")
-                spec_tensor = np.zeros((1, 9, 128, TARGET_FRAMES), dtype=np.float32)
-            feed["spec_features"] = spec_tensor
+        audio_tensor = prepare_audio_tensor(audio) # (1, 32000)
 
-        outputs = session.run(None, feed)
-        logits = outputs[0][0]
+        if torch_model is not None:
+            import torch
+            with torch.no_grad():
+                device = next(torch_model.parameters()).device
+                t_in = torch.from_numpy(audio_tensor).to(device)
+                out = torch_model(t_in)
+                logits = out["logits"][0].cpu().numpy()
+        else:
+            input_names = [i.name for i in session.get_inputs()]
+            feed = {"audio": audio_tensor}
+            if "spec_features" in input_names:
+                try:
+                    spec_tensor = extract_spec_features(audio_tensor[0])
+                except Exception as e:
+                    log.warning(f"Feature extraction failed, using dummy zeros: {e}")
+                    spec_tensor = np.zeros((1, 9, 128, TARGET_FRAMES), dtype=np.float32)
+                feed["spec_features"] = spec_tensor
+
+            outputs = session.run(None, feed)
+            logits = outputs[0][0]
 
         # Calculate continuous probability of fake
         if len(logits) == 2:
@@ -283,6 +315,4 @@ async def predict(request: PredictRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    log.info("Starting Tatvaani server on http://0.0.0.0:8000")
-    log.info("Docs: http://localhost:8000/docs")
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

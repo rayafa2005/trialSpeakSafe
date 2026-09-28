@@ -49,8 +49,8 @@ class ServerClient {
         //   2. Start API: cd tatvaani_ml/server && uvicorn app:app --host 0.0.0.0 --port 8000
         //   3. Set: ServerClient.SERVER_URL = "http://192.168.1.42:8000"
         //      (or TatvaaniViewModel.setServerUrl(...) before testing)
-        // See tatvaani_android/DEMO_SPRINT.md for OnePlus demo steps.
-        var SERVER_URL = "http://172.25.63.85:8000"
+        // PC IPv4: 192.168.137.109 | Emulator: 10.0.2.2
+        var SERVER_URL = "http://192.168.137.109:8000"
 
         private const val ENDPOINT    = "/predict"
         private const val TIMEOUT_SEC = 5L

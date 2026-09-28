@@ -269,7 +269,7 @@ def main():
     # Load model
     model = TatvaNet(sample_rate=args.sample_rate).to(device)
     ckpt  = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
     print(f"[Eval] Model loaded. Best EER from training: "
           f"{100*ckpt.get('best_eer', 0):.2f}%")

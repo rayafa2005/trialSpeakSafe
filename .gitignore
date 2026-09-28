@@ -6,6 +6,8 @@ __pycache__/
 # PyTorch checkpoints and training runs
 runs/
 *.tfevents.*
+best_model/
+checkpoints/best_model/
 
 # Large audio data files (raw & processed audio)
 data/raw/
