@@ -172,7 +172,7 @@ def prepare_tr_data(target_n: int = 300, out_dir: str = "data/raw/tr_finetune") 
     records = []
     for f in tr_files:
         spk = os.path.basename(f).split("-")[-1].split(".")[0].strip()
-        wav, sr = load_audio_robust(f)
+        wav = load_audio_robust(f)
         if wav is not None and wav.shape[-1] >= 16000:
             total_s = wav.shape[-1]
             for start in range(0, max(1, total_s - 32000 + 1), 10000):  # ~0.6s stride

@@ -10,7 +10,10 @@ best_model/
 best_model (2)/
 checkpoints/best_model/
 checkpoints/best_model_new.pt
+checkpoints/*_backup.*
 export/tatvanet_new.onnx
+export/*_backup.*
+tatvaani_android/app/src/main/assets/*_backup.*
 
 # Large audio data files (raw & processed audio)
 data/raw/
