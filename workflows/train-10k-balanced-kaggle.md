@@ -16,6 +16,7 @@
 
 1. **Cell 1 — Sync Repo & Verify In-Graph `ConvSTFT`**:
    - Clone `https://github.com/rayafa2005/trialSpeakSafe.git` on Kaggle GPU (`T4` / `P100`).
+   - Run `!pip install -q huggingface_hub pyarrow onnx onnxruntime onnxscript librosa soundfile`.
    - Verify `_to_db(top_db=80.0)` clamps dynamic range to `<= 80.0 dB` and confirm all 46 files in `tr/` and 9 files in `test_audio(razz)/fake` are present.
 2. **Cell 2 — Process Custom `tr/` Dataset + Ingest External Real/Fake Corpora**:
    - Group the 46 real mobile recordings in `tr/` (`40 .m4a`, `5 .mp3`, `1 .opus`) by their **16 true speaker names** (`<title> - <Speaker>.<ext>`).
@@ -30,6 +31,7 @@
 5. **Cell 5 (Optional) — Baseline-Gated Fine-Tuning**:
    - Run `python training/train.py ... --finetune checkpoints/best_model.pt --epochs 8 --lr 0.0001`. `train.py` first evaluates the existing `best_model.pt` on `val_manifest_kaggle.csv` and only overwrites `best_model.pt` if a fine-tuned epoch achieves a strictly lower Val EER.
 6. **Cell 6 — Export `/kaggle/working/tatvanet.onnx` & Check Parity**:
-   - Export `checkpoints/best_model.pt` to `/kaggle/working/tatvanet.onnx` (`clip_samples=32000`) and verify PyTorch vs. ONNX Runtime parity.
+   - Install export requirements (`!pip install onnxruntime soundfile librosa onnxscript`) and navigate into `/kaggle/working/trialSpeakSafe`.
+   - Export `checkpoints/best_model.pt` to `/kaggle/working/tatvanet.onnx` (`clip_samples=32000`) and verify PyTorch vs. ONNX Runtime parity ($< 10^{-3}$). If an interactive kernel restarts after Cell 4, Cell 6 recovers cleanly from `checkpoints/best_model.pt` without re-running training.
 7. **Cell 7 — Gatekeeper Benchmark & Download Brief**:
    - Run `python TEST_FOLDER_AUDIOS.py --onnx /kaggle/working/tatvanet.onnx --checkpoint /kaggle/working/best_model.pt` and present 1-click download links.
