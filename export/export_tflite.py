@@ -90,6 +90,16 @@ def export_onnx(
 
     Returns: path to saved .onnx file
     """
+    try:
+        import onnxscript
+    except ImportError:
+        try:
+            import subprocess, sys
+            print("[Export] Installing missing 'onnxscript' required by PyTorch ONNX exporter...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "onnxscript"])
+        except Exception:
+            pass
+
     import torch.onnx
 
     print(f"\n[Export] Exporting to ONNX...")
