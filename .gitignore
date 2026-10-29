@@ -7,7 +7,10 @@ __pycache__/
 runs/
 *.tfevents.*
 best_model/
+best_model (2)/
 checkpoints/best_model/
+checkpoints/best_model_new.pt
+export/tatvanet_new.onnx
 
 # Large audio data files (raw & processed audio)
 data/raw/
