@@ -17,6 +17,12 @@ data/processed/
 *.mp3
 *.ogg
 
+# Explicitly track custom real dataset (tr/) and held-out benchmark (test_audio(razz)/)
+!tr/
+!tr/**
+!test_audio(razz)/
+!test_audio(razz)/**
+
 # Temporary test exports
 export/test_*.onnx
 export/out.txt
@@ -24,6 +30,7 @@ export/out.txt
 # Android build outputs & local caches
 tatvaani_android/app/build/
 tatvaani_android/.gradle/
+tatvaani_android/.kotlin/
 tatvaani_android/local.properties
 tatvaani_android/.idea/
 .idea/

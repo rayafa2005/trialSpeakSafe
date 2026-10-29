@@ -2,6 +2,7 @@ package com.tatvaani.app.inference
 
 import android.util.Base64
 import android.util.Log
+import com.tatvaani.app.features.FeatureExtractor
 import com.tatvaani.app.model.InferenceSource
 import com.tatvaani.app.model.Verdict
 import com.tatvaani.app.model.VerdictResult
@@ -21,40 +22,22 @@ import java.util.concurrent.TimeUnit
  * ===============
  * Tatvaani — Server-Side Inference REST Client
  *
- * Sends PCM audio to the FastAPI server and receives a verdict.
- * Runs in parallel with TFLiteEngine for latency benchmarking.
- *
- * The LatencyCard UI shows:
- *   On-Device: ~45ms  |  Server: ~280ms
- *
- * SERVER ENDPOINT: POST /predict
- *
- * Request JSON:
- *   { "audio_b64": "<base64 float32 PCM>", "sample_rate": 16000 }
- *
- * Response JSON:
- *   { "verdict": "safe|caution|danger", "confidence": 0.87,
- *     "probs": [0.87, 0.08, 0.05], "latency_ms": 23 }
- *
- * Times out after 5 seconds — on-device result always shown regardless.
+ * Sends the exact same 32,000-sample float32 waveform passed to OnnxEngine
+ * over HTTP POST /predict for cloud latency and parity benchmarking.
  */
 class ServerClient {
 
     companion object {
         private const val TAG = "ServerClient"
 
-        // Emulator → host PC:  "http://10.0.2.2:8000"
-        // Physical device → PC on same Wi‑Fi (NOT 10.0.2.2):
-        //   1. On PC: ipconfig (Windows) or ip addr — note IPv4 e.g. 192.168.1.42
-        //   2. Start API: cd tatvaani_ml/server && uvicorn app:app --host 0.0.0.0 --port 8000
-        //   3. Set: ServerClient.SERVER_URL = "http://192.168.1.42:8000"
-        //      (or TatvaaniViewModel.setServerUrl(...) before testing)
         // PC IPv4: 192.168.137.109 | Emulator: 10.0.2.2
-        var SERVER_URL = "http://192.168.137.109:8000"
+        var SERVER_URL = "http://10.37.221.85:8000"
 
         private const val ENDPOINT    = "/predict"
         private const val TIMEOUT_SEC = 5L
     }
+
+    private val featureExtractor = FeatureExtractor()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(TIMEOUT_SEC, TimeUnit.SECONDS)
@@ -62,24 +45,24 @@ class ServerClient {
         .writeTimeout(TIMEOUT_SEC, TimeUnit.SECONDS)
         .build()
 
-    // ── Main inference call ───────────────────────────────────────────────────
+    suspend fun predict(pcm: ShortArray): VerdictResult? {
+        val preparedAudio = featureExtractor.toModelAudio(pcm, FeatureExtractor.TARGET_SAMPLES)
+        return predictPreparedAudio(preparedAudio)
+    }
 
     /**
-     * Send PCM audio to server and return verdict.
-     * Suspending — call from a coroutine scope.
-     *
-     * @param pcm Raw PCM ShortArray from AudioCaptureService
-     * @return VerdictResult with source=SERVER, or null if request failed
+     * Send the exact FloatArray(32000) prepared for on-device inference to the server
+     * so both models receive bit-for-bit identical input audio.
      */
-    suspend fun predict(pcm: ShortArray): VerdictResult? = withContext(Dispatchers.IO) {
+    suspend fun predictPreparedAudio(audioFloats: FloatArray): VerdictResult? = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
 
         try {
-            val audioB64 = encodeAudio(pcm)
+            val audioB64 = encodeFloatAudio(audioFloats)
 
             val json = JSONObject().apply {
                 put("audio_b64",   audioB64)
-                put("sample_rate", 16000)
+                put("sample_rate", FeatureExtractor.SAMPLE_RATE)
             }.toString()
 
             val requestBody = json.toRequestBody("application/json".toMediaType())
@@ -101,29 +84,20 @@ class ServerClient {
             parseResponse(body, latencyMs)
 
         } catch (e: Exception) {
-            // Silently fail — on-device result shown regardless
             Log.w(TAG, "Server request failed: ${e.message}")
             null
         }
     }
 
-    // ── Audio encoding ────────────────────────────────────────────────────────
-
-    /**
-     * Convert PCM ShortArray → float32 bytes → Base64 string.
-     * Server receives float32 normalized to [-1, 1].
-     */
-    private fun encodeAudio(pcm: ShortArray): String {
+    private fun encodeFloatAudio(audioFloats: FloatArray): String {
         val buffer = ByteBuffer
-            .allocate(pcm.size * 4)
+            .allocate(audioFloats.size * 4)
             .order(ByteOrder.LITTLE_ENDIAN)
-        for (sample in pcm) {
-            buffer.putFloat(sample / 32768.0f)
+        for (sample in audioFloats) {
+            buffer.putFloat(sample)
         }
         return Base64.encodeToString(buffer.array(), Base64.NO_WRAP)
     }
-
-    // ── Response parsing ──────────────────────────────────────────────────────
 
     private fun parseResponse(json: String, clientLatencyMs: Long): VerdictResult? {
         return try {
@@ -140,23 +114,21 @@ class ServerClient {
                 }
             }
 
-            // Trust server's direct calibrated verdict & confidence
             val verdict = when (verdictStr.lowercase()) {
                 "safe"    -> Verdict.SAFE
                 "danger"  -> Verdict.DANGER
                 else      -> Verdict.CAUTION
             }
-            val resolvedConfidence = confidence
 
             Log.d(
                 TAG,
-                "Server: api=$verdictStr resolved=$verdict (${(resolvedConfidence * 100).toInt()}%) " +
+                "Server: api=$verdictStr resolved=$verdict (${(confidence * 100).toInt()}%) " +
                         "probs=[${probs.joinToString { "%.2f".format(it) }}] in ${clientLatencyMs}ms"
             )
 
             VerdictResult(
                 verdict    = verdict,
-                confidence = resolvedConfidence,
+                confidence = confidence,
                 probs      = probs,
                 latencyMs  = clientLatencyMs,
                 source     = InferenceSource.SERVER

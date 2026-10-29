@@ -9,6 +9,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.tatvaani.app.audio.AudioCaptureService
+import com.tatvaani.app.features.FeatureExtractor
 import com.tatvaani.app.inference.OnnxEngine
 import com.tatvaani.app.inference.ServerClient
 import com.tatvaani.app.inference.TFLiteEngine
@@ -24,21 +25,18 @@ import kotlinx.coroutines.launch
  * ====================
  * Tatvaani — Main ViewModel
  *
- * Fixed flow:
- *  1. startCapture() starts the foreground service (microphone capture)
- *  2. bindService() connects to get the Binder reference
- *  3. onServiceConnected() sets callbacks then calls startCapture() on service
- *  4. Service captures audio and calls onCaptureComplete callback
- *  5. ViewModel runs TFLite + Server inference in parallel
- *  6. Results pushed to UI via StateFlow
+ * Dual-Pipeline Execution:
+ *  1. Captures 2.0s (32,000 samples) of raw 16kHz mono PCM via AudioCaptureService.
+ *  2. Converts PCM once into a single peak-normalized FloatArray(32000) with zero filtering.
+ *  3. Dispatches the exact same FloatArray(32000) in parallel to:
+ *     - Primary On-Device Engine (OnnxEngine -> TFLiteEngine fallback)
+ *     - Secondary Cloud Benchmark Server (ServerClient)
  */
 class TatvaaniViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "TatvaaniViewModel"
     }
-
-    // ── UI State ──────────────────────────────────────────────────────────────
 
     sealed class UiState {
         object Idle       : UiState()
@@ -55,11 +53,12 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
     private val _uiState = MutableStateFlow<UiState>(UiState.Idle)
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    // ── Engines ───────────────────────────────────────────────────────────────
+    // ── Engines (ONNX is primary on-device engine) ────────────────────────────
 
-    private val tfliteEngine = TFLiteEngine(application)
-    private val onnxEngine   = OnnxEngine(application)
-    private val serverClient = ServerClient()
+    private val onnxEngine       = OnnxEngine(application)
+    private val tfliteEngine     = TFLiteEngine(application)
+    private val serverClient     = ServerClient()
+    private val featureExtractor = FeatureExtractor()
 
     // ── Service ───────────────────────────────────────────────────────────────
 
@@ -73,11 +72,9 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
             serviceBound   = true
             Log.d(TAG, "Service connected — starting capture")
 
-            // Set callbacks before starting capture
             captureService?.onCaptureComplete = { pcm -> onAudioCaptured(pcm) }
             captureService?.onCaptureError    = { msg -> onCaptureError(msg) }
 
-            // Start capture immediately — projection token is already in the service
             captureService?.startCapture()
         }
 
@@ -91,13 +88,13 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
 
     init {
         viewModelScope.launch {
-            val tfliteOk = tfliteEngine.initialize()
-            Log.d(TAG, "TFLite ready: ${tfliteEngine.isReady}")
-            if (!tfliteOk) {
-                val onnxOk = onnxEngine.initialize()
-                Log.d(TAG, "ONNX ready: ${onnxEngine.isReady}")
-                if (!onnxOk) {
-                    Log.w(TAG, "On-device inference unavailable (TFLite+ONNX failed)")
+            val onnxOk = onnxEngine.initialize()
+            Log.d(TAG, "ONNX primary ready: ${onnxEngine.isReady}")
+            if (!onnxOk) {
+                val tfliteOk = tfliteEngine.initialize()
+                Log.d(TAG, "TFLite fallback ready: ${tfliteEngine.isReady}")
+                if (!tfliteOk) {
+                    Log.w(TAG, "On-device inference unavailable (ONNX+TFLite failed)")
                 }
             }
         }
@@ -105,20 +102,12 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /**
-     * Called from MainActivity after RECORD_AUDIO permission granted.
-     * Starts foreground service, then binds to get callbacks.
-     */
     fun startCapture() {
         _uiState.value = UiState.Recording
         val context = getApplication<Application>()
 
         val serviceIntent = android.content.Intent(context, AudioCaptureService::class.java)
-
-        // Start as foreground service first (required before bind on Android 10+)
         context.startForegroundService(serviceIntent)
-
-        // Bind to get the Binder for callbacks
         context.bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
@@ -149,14 +138,18 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = UiState.Processing
 
         viewModelScope.launch {
+            // Prepare raw 32,000-sample float32 waveform ONCE so both On-Device and Server
+            // receive bit-for-bit identical audio without any external filtering.
+            val preparedAudio = featureExtractor.toModelAudio(pcm, FeatureExtractor.TARGET_SAMPLES)
+
             val onDeviceDeferred = async {
                 when {
-                    tfliteEngine.isReady -> tfliteEngine.runInference(pcm)
-                    onnxEngine.isReady   -> onnxEngine.runInference(pcm)
+                    onnxEngine.isReady   -> onnxEngine.runInferenceOnPreparedAudio(preparedAudio)
+                    tfliteEngine.isReady -> tfliteEngine.runInferenceOnPreparedAudio(preparedAudio)
                     else                 -> null
                 }
             }
-            val serverDeferred   = async { serverClient.predict(pcm) }
+            val serverDeferred = async { serverClient.predictPreparedAudio(preparedAudio) }
 
             val onDeviceResult = onDeviceDeferred.await()
             val serverResult   = serverDeferred.await()
@@ -164,11 +157,10 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
             _uiState.value = when {
                 onDeviceResult != null || serverResult != null ->
                     UiState.Result(onDevice = onDeviceResult, server = serverResult)
-                !tfliteEngine.isReady && !onnxEngine.isReady ->
+                !onnxEngine.isReady && !tfliteEngine.isReady ->
                     UiState.Error(
                         "Capture succeeded, but on-device model is not loaded.\n\n" +
-                                "For TFLite: copy tatvanet_int8.tflite into app/src/main/assets/.\n" +
-                                "For ONNX: copy tatvanet.onnx into app/src/main/assets/.\n\n" +
+                                "Copy export/tatvanet.onnx into app/src/main/assets/.\n\n" +
                                 "Server benchmark also failed — check SERVER_URL and that the API is running."
                     )
                 else ->
@@ -197,7 +189,7 @@ class TatvaaniViewModel(application: Application) : AndroidViewModel(application
     override fun onCleared() {
         super.onCleared()
         unbindService()
-        tfliteEngine.close()
         onnxEngine.close()
+        tfliteEngine.close()
     }
 }

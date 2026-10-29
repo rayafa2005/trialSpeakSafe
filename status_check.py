@@ -16,6 +16,9 @@ import sys
 from pathlib import Path
 import csv
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+
 ML_ROOT = Path(__file__).resolve().parent
 
 print("=" * 60)

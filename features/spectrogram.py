@@ -67,6 +67,9 @@ class ConvSTFT(nn.Module):
 
 def _to_db(x: torch.Tensor, top_db: float = TOP_DB) -> torch.Tensor:
     log_spec = 20.0 * torch.log10(torch.clamp(x, min=1e-5))
+    if top_db is not None and top_db > 0:
+        max_val = log_spec.amax(dim=(-2, -1), keepdim=True)
+        log_spec = torch.clamp(log_spec, min=max_val - top_db)
     return log_spec
 
 

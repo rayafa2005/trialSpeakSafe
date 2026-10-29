@@ -96,8 +96,8 @@ class AudioCaptureService : Service() {
     fun startCapture(durationSec: Int = CAPTURE_DURATION) {
         captureJob = serviceScope.launch {
             val sourcesToTry = listOf(
+                MediaRecorder.AudioSource.UNPROCESSED,
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 MediaRecorder.AudioSource.MIC
             )
 

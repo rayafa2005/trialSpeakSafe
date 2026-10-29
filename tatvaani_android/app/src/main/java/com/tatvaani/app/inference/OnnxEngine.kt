@@ -10,26 +10,22 @@ import com.tatvaani.app.model.InferenceSource
 import com.tatvaani.app.model.Verdict
 import com.tatvaani.app.model.VerdictResult
 import java.nio.FloatBuffer
+import kotlin.math.exp
 
 /**
  * OnnxEngine.kt
- * ============
- * Tatvaani — On-device ONNX Runtime inference.
+ * =============
+ * Tatvaani — Primary On-Device ONNX Runtime Inference Engine.
  *
- * This is a fallback path when TFLite export/conversion is blocked.
- * It runs the exported ONNX model with two inputs:
- *  - audio:         float32 (1, 32000)
- *  - spec_features: float32 (1, 9, 128, T)
- *
- * Output:
- *  - logits: float32 (1, 3)
+ * Feeds the raw 2.0-second audio waveform (1, 32000) directly into
+ * `tatvanet.onnx`. All spectral and delta feature extraction happens
+ * inside the model graph (ConvSTFT + SincConv).
  */
 class OnnxEngine(private val context: Context) {
 
     companion object {
         private const val TAG = "OnnxEngine"
         private const val MODEL_FILE = "tatvanet.onnx"
-        private const val N_CLASSES = 3
     }
 
     private var env: OrtEnvironment? = null
@@ -48,7 +44,7 @@ class OnnxEngine(private val context: Context) {
             if (bytes.size < 1024 * 1024) {
                 loadSkipReason =
                     "On-device ONNX model not installed. " +
-                            "Copy tatvaani_ml/export/tatvanet.onnx into app/src/main/assets/."
+                            "Copy export/tatvanet.onnx into app/src/main/assets/."
                 Log.w(TAG, loadSkipReason!!)
                 return false
             }
@@ -57,7 +53,7 @@ class OnnxEngine(private val context: Context) {
             val s = e.createSession(bytes, opts)
             env = e
             session = s
-            Log.d(TAG, "ONNX model loaded: $MODEL_FILE")
+            Log.d(TAG, "ONNX model loaded: $MODEL_FILE (inputs=${s.inputNames})")
             true
         } catch (e: Exception) {
             loadSkipReason = "Failed to load ONNX model: ${e.message}"
@@ -67,6 +63,11 @@ class OnnxEngine(private val context: Context) {
     }
 
     fun runInference(pcm: ShortArray): VerdictResult? {
+        val audio = featureExtractor.toModelAudio(pcm, FeatureExtractor.TARGET_SAMPLES)
+        return runInferenceOnPreparedAudio(audio)
+    }
+
+    fun runInferenceOnPreparedAudio(audio: FloatArray): VerdictResult? {
         val s = session ?: run {
             Log.e(TAG, "ONNX session not initialized")
             return null
@@ -76,53 +77,20 @@ class OnnxEngine(private val context: Context) {
             return null
         }
 
-        //val start = System.currentTimeMillis()
-
         val start = System.currentTimeMillis()
-
-        // Input: peak-normalized waveform (1, 32000) for 2.0s @ 16kHz
-        val targetSamples = FeatureExtractor.TARGET_SAMPLES
-        val audio = featureExtractor.toModelAudio(pcm, targetSamples)
-
         val audioTensor = OnnxTensor.createTensor(
             e,
             FloatBuffer.wrap(audio),
-            longArrayOf(1, targetSamples.toLong())
+            longArrayOf(1, audio.size.toLong())
         )
 
-        var featTensor: OnnxTensor? = null
-
         try {
-            val inputNames = s.inputNames
-            val inputs = mutableMapOf<String, OnnxTensor>("audio" to audioTensor)
-
-            // Backward compatibility if ONNX expects legacy spec_features input
-            if (inputNames.contains("spec_features")) {
-                val feats = featureExtractor.extract(pcm)
-                    ?: FloatArray(9 * 128 * FeatureExtractor.TARGET_FRAMES)
-                featTensor = OnnxTensor.createTensor(
-                    e,
-                    FloatBuffer.wrap(feats),
-                    longArrayOf(1, 9, 128, FeatureExtractor.TARGET_FRAMES.toLong())
-                )
-                inputs["spec_features"] = featTensor
-            }
-
+            val inputs = mapOf("audio" to audioTensor)
             s.run(inputs).use { results ->
                 val logitsAny = results[0].value
-                val logits = (logitsAny as Array<FloatArray>)[0] // (1, 2) or (1, 3)
-                
-                val pFake = if (logits.size == 2) {
-                    val exp0 = kotlin.math.exp(logits[0].toDouble())
-                    val exp1 = kotlin.math.exp(logits[1].toDouble())
-                    (exp1 / (exp0 + exp1)).toFloat()
-                } else if (logits.size == 3) {
-                    val probs = softmax(logits)
-                    probs[2]
-                } else {
-                    (1.0 / (1.0 + kotlin.math.exp(-logits[0].toDouble()))).toFloat()
-                }
+                val logits = (logitsAny as Array<FloatArray>)[0] // (1, 2)
 
+                val pFake = computeFakeProbability(logits)
                 val latency = System.currentTimeMillis() - start
                 return Verdict.evaluateProbability(pFake, latency, InferenceSource.ON_DEVICE)
             }
@@ -131,7 +99,6 @@ class OnnxEngine(private val context: Context) {
             return null
         } finally {
             audioTensor.close()
-            featTensor?.close()
         }
     }
 
@@ -142,19 +109,24 @@ class OnnxEngine(private val context: Context) {
         env = null
     }
 
-    private fun softmax(logits: FloatArray): FloatArray {
-        val max = logits.maxOrNull() ?: 0f
-        var sum = 0.0
-        val exps = FloatArray(logits.size)
-        for (i in logits.indices) {
-            val v = kotlin.math.exp((logits[i] - max).toDouble()).toFloat()
-            exps[i] = v
-            sum += v.toDouble()
+    private fun computeFakeProbability(logits: FloatArray): Float {
+        return when (logits.size) {
+            2 -> {
+                val maxLogit = maxOf(logits[0], logits[1]).toDouble()
+                val exp0 = exp(logits[0].toDouble() - maxLogit)
+                val exp1 = exp(logits[1].toDouble() - maxLogit)
+                (exp1 / (exp0 + exp1)).toFloat()
+            }
+            3 -> {
+                val maxLogit = (logits.maxOrNull() ?: 0f).toDouble()
+                val exp0 = exp(logits[0].toDouble() - maxLogit)
+                val exp1 = exp(logits[1].toDouble() - maxLogit)
+                val exp2 = exp(logits[2].toDouble() - maxLogit)
+                (exp2 / (exp0 + exp1 + exp2)).toFloat()
+            }
+            else -> {
+                (1.0 / (1.0 + exp(-logits[0].toDouble()))).toFloat()
+            }
         }
-        val out = FloatArray(logits.size)
-        val denom = if (sum <= 0.0) 1.0 else sum
-        for (i in exps.indices) out[i] = (exps[i] / denom.toFloat())
-        return out
     }
 }
-

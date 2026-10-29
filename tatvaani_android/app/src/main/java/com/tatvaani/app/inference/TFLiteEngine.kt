@@ -12,80 +12,65 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import kotlin.math.exp
 
 /**
  * TFLiteEngine.kt
  * ===============
- * Tatvaani — On-Device TFLite Model Inference
+ * Tatvaani — Secondary On-Device TFLite Model Inference
  *
- * Loads tatvanet_int8.tflite from assets/ and runs inference.
- * Uses CPU inference — compatible with all Android devices including
- * those with 16KB page size requirements (Android 15+).
- *
- * LATENCY TARGET: < 50ms on mid-range Android (achieved on CPU with INT8 model)
+ * Feeds the raw 2.0-second waveform (1, 32000) directly into `tatvanet_int8.tflite`.
+ * Dynamically reads output tensor class count (2 logits).
  */
 class TFLiteEngine(private val context: Context) {
 
     companion object {
         private const val TAG        = "TFLiteEngine"
         private const val MODEL_FILE = "tatvanet_int8.tflite"
-        private const val N_CLASSES  = 3
     }
 
     private var interpreter:      Interpreter?      = null
     private val featureExtractor = FeatureExtractor()
 
-    /** Set when assets/tatvanet_int8.tflite is missing or still the 0-byte placeholder. */
     var loadSkipReason: String? = null
         private set
 
-    // ── Initialization ────────────────────────────────────────────────────────
-
-    /**
-     * Load TFLite model from assets. Call once at app start on a background thread.
-     * Uses CPU with 4 threads — compatible with all devices, no native lib issues.
-     * Skips load if the asset is empty (demo placeholder) until the real export is copied in.
-     */
     fun initialize(): Boolean {
         loadSkipReason = null
         return try {
             val assetFd = context.assets.openFd(MODEL_FILE)
             if (assetFd.declaredLength < 1024L) {
                 loadSkipReason =
-                    "On-device model not installed (placeholder asset). " +
-                            "Copy export/tatvanet_int8.tflite into app/src/main/assets/."
+                    "On-device TFLite model not installed (placeholder asset). " +
+                            "Using ONNX primary engine."
                 Log.w(TAG, loadSkipReason!!)
                 return false
             }
 
             val modelBuffer = loadModelFile(assetFd)
             val options     = Interpreter.Options().apply {
-                numThreads = 4   // Use all available CPU threads
+                numThreads = 4
             }
             interpreter = Interpreter(modelBuffer, options)
             Log.d(TAG, "TFLite model loaded: $MODEL_FILE")
             logTensorShapes()
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load model: ${e.message}")
+            Log.e(TAG, "Failed to load TFLite model: ${e.message}")
             false
         }
     }
 
-    // Keep old signature for compatibility with ViewModel
     fun initialize(useGpu: Boolean = false): Boolean = initialize()
 
     val isReady: Boolean get() = interpreter != null
 
-    // ── Inference ─────────────────────────────────────────────────────────────
-
-    /**
-     * Run full inference: PCM → features → TFLite → VerdictResult
-     *
-     * @param pcm Raw PCM ShortArray from AudioCaptureService (16kHz, mono)
-     * @return VerdictResult or null if inference failed
-     */
     fun runInference(pcm: ShortArray): VerdictResult? {
+        val audioFloats = featureExtractor.toModelAudio(pcm, FeatureExtractor.TARGET_SAMPLES)
+        return runInferenceOnPreparedAudio(audioFloats)
+    }
+
+    fun runInferenceOnPreparedAudio(audioFloats: FloatArray): VerdictResult? {
         val interp = interpreter ?: run {
             Log.e(TAG, "Interpreter not initialized")
             return null
@@ -93,34 +78,22 @@ class TFLiteEngine(private val context: Context) {
 
         val startTime = System.currentTimeMillis()
 
-        // Step 0: peak-normalized audio (float32, shape [1, 80000]) for 5.0s @ 16kHz
-        val targetSamples = FeatureExtractor.TARGET_SAMPLES
-        val audioFloats = featureExtractor.toModelAudio(pcm, targetSamples)
         val audioBuffer = ByteBuffer
             .allocateDirect(audioFloats.size * 4)
             .order(ByteOrder.nativeOrder())
         audioBuffer.asFloatBuffer().put(audioFloats)
         audioBuffer.rewind()
 
-        // Output buffer [1, 2] or [1, 3]
-        val outputArray = Array(1) { FloatArray(N_CLASSES) }
+        val outShape = try {
+            interp.getOutputTensor(0).shape()
+        } catch (_: Exception) {
+            intArrayOf(1, 2)
+        }
+        val numClasses = if (outShape.size >= 2) outShape[1] else 2
+        val outputArray = Array(1) { FloatArray(numClasses) }
 
-        // Step 1: Run inference
         try {
-            val inputTensorCount = interp.inputTensorCount
-            if (inputTensorCount == 1) {
-                interp.run(audioBuffer, outputArray)
-            } else {
-                val dummyFeats = FloatArray(9 * 128 * FeatureExtractor.TARGET_FRAMES)
-                val featBuffer = ByteBuffer
-                    .allocateDirect(dummyFeats.size * 4)
-                    .order(ByteOrder.nativeOrder())
-                featBuffer.asFloatBuffer().put(dummyFeats)
-                featBuffer.rewind()
-                val inputs = arrayOf<Any>(audioBuffer, featBuffer)
-                val outputs = hashMapOf<Int, Any>(0 to outputArray)
-                interp.runForMultipleInputsOutputs(inputs, outputs)
-            }
+            interp.run(audioBuffer, outputArray)
         } catch (e: Exception) {
             Log.e(TAG, "Inference failed: ${e.message}")
             return null
@@ -128,26 +101,28 @@ class TFLiteEngine(private val context: Context) {
 
         val latencyMs = System.currentTimeMillis() - startTime
         val logits = outputArray[0]
-        
-        val pFake = if (logits.size == 2) {
-            val exp0 = kotlin.math.exp(logits[0].toDouble())
-            val exp1 = kotlin.math.exp(logits[1].toDouble())
-            (exp1 / (exp0 + exp1)).toFloat()
-        } else if (logits.size == 3) {
-            val max = logits.maxOrNull() ?: 0f
-            val exp0 = kotlin.math.exp((logits[0] - max).toDouble())
-            val exp1 = kotlin.math.exp((logits[1] - max).toDouble())
-            val exp2 = kotlin.math.exp((logits[2] - max).toDouble())
-            val sum = exp0 + exp1 + exp2
-            (exp2 / sum).toFloat()
-        } else {
-            (1.0 / (1.0 + kotlin.math.exp(-logits[0].toDouble()))).toFloat()
+
+        val pFake = when (logits.size) {
+            2 -> {
+                val maxLogit = maxOf(logits[0], logits[1]).toDouble()
+                val exp0 = exp(logits[0].toDouble() - maxLogit)
+                val exp1 = exp(logits[1].toDouble() - maxLogit)
+                (exp1 / (exp0 + exp1)).toFloat()
+            }
+            3 -> {
+                val maxLogit = (logits.maxOrNull() ?: 0f).toDouble()
+                val exp0 = exp(logits[0].toDouble() - maxLogit)
+                val exp1 = exp(logits[1].toDouble() - maxLogit)
+                val exp2 = exp(logits[2].toDouble() - maxLogit)
+                (exp2 / (exp0 + exp1 + exp2)).toFloat()
+            }
+            else -> {
+                (1.0 / (1.0 + exp(-logits[0].toDouble()))).toFloat()
+            }
         }
 
         return Verdict.evaluateProbability(pFake, latencyMs, InferenceSource.ON_DEVICE)
     }
-
-    // ── Model loading ─────────────────────────────────────────────────────────
 
     private fun loadModelFile(assetFd: android.content.res.AssetFileDescriptor): MappedByteBuffer {
         val inputStream = FileInputStream(assetFd.fileDescriptor)
@@ -169,8 +144,6 @@ class TFLiteEngine(private val context: Context) {
             Log.w(TAG, "Could not read tensor shapes: ${e.message}")
         }
     }
-
-    // ── Cleanup ───────────────────────────────────────────────────────────────
 
     fun close() {
         interpreter?.close()

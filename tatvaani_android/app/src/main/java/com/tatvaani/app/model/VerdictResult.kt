@@ -97,13 +97,13 @@ enum class Verdict(
 
         /**
          * Choose which pipeline drives the main result UI when both ran.
-         * Prioritizes the SERVER verdict if available; falls back to on-device when server is null.
+         * Prioritizes the ON_DEVICE verdict as primary; falls back to server only if on-device is null.
          */
         fun pickPrimaryForDisplay(
             onDevice: VerdictResult?,
             server: VerdictResult?
         ): VerdictResult? {
-            return server ?: onDevice
+            return onDevice ?: server
         }
     }
 }

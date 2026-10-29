@@ -1,15 +1,15 @@
 """
-APP.PY WAS UPDATED TO FIT THE PIPELINE BETTER. THE MODEL IS BEING LOADED IN ONNX FORM
 server/app.py
 =============
 Tatvaani — FastAPI Server Inference Endpoint
 
-Receives base64-encoded PCM audio from the Android app,
-runs TatvaNet ONNX inference, returns verdict + latency.
+Receives base64-encoded float32 raw PCM audio from the Android app,
+feeds the raw (1, 32000) audio directly into TatvaNet (ONNX / PyTorch)
+with zero external spectrogram preprocessing, and returns verdict + latency.
 
 USAGE:
-  pip install fastapi uvicorn onnxruntime librosa numpy scipy
-  py server/app.py
+  pip install fastapi uvicorn onnxruntime numpy
+  python server/app.py
   OR
   uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 
@@ -26,8 +26,6 @@ from pathlib import Path
 from collections import deque
 
 import numpy as np
-import librosa
-import scipy.special
 import onnxruntime as ort
 
 from fastapi import FastAPI, HTTPException
@@ -46,7 +44,7 @@ log = logging.getLogger("tatvaani_server")
 
 app = FastAPI(
     title="Tatvaani Inference Server",
-    description="Real-time AI audio deepfake detection",
+    description="Real-time AI audio deepfake detection (In-Graph TatvaNet)",
     version="1.0.0"
 )
 
@@ -60,35 +58,12 @@ app.add_middleware(
 # ── Global model state ────────────────────────────────────────────────────────
 
 session = None
+torch_model = None
+loaded_model_source = None
 recent_latencies = deque(maxlen=100)
-
-LABEL_NAMES = {0: "safe", 1: "caution", 2: "danger"}
 
 # Match Android 2.0s baseline (32,000 samples @ 16kHz)
 TARGET_SAMPLES = 32000  # 2.0 seconds at 16kHz
-TARGET_FRAMES = 201     # 1 + 32000 / 160
-
-
-def extract_spec_features(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
-    """Extract 9-channel spectrogram features (1, 9, 128, 201) matching model training."""
-    specs = []
-    for n_mels in [64, 128, 128]:
-        mel = librosa.feature.melspectrogram(
-            y=audio, sr=sr, n_mels=n_mels, n_fft=512, hop_length=160
-        )
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        mel_db = librosa.util.fix_length(mel_db, size=TARGET_FRAMES, axis=1)
-        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
-        if mel_db.shape[0] != 128:
-            mel_db = np.resize(mel_db, (128, TARGET_FRAMES))
-        specs.append(mel_db)
-
-    for i in range(3):
-        specs.append(librosa.feature.delta(specs[i]))
-    for i in range(3):
-        specs.append(librosa.feature.delta(specs[i], order=2))
-
-    return np.stack(specs)[np.newaxis].astype(np.float32)
 
 
 def verdict_from_prob(p_fake: float) -> tuple[str, float, list[float]]:
@@ -118,26 +93,44 @@ def verdict_from_prob(p_fake: float) -> tuple[str, float, list[float]]:
 
 
 def prepare_audio_tensor(audio: np.ndarray) -> np.ndarray:
-    """Pad or trim audio to exactly TARGET_SAMPLES (2.0s @ 16kHz)."""
+    """
+    Pad or trim audio to exactly TARGET_SAMPLES (32,000 samples = 2.0s @ 16kHz)
+    and peak-normalize so max(|x|) == 1.0, identical to Android FeatureExtractor.toModelAudio.
+    """
     if len(audio) < TARGET_SAMPLES:
         audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)))
-    else:
+    elif len(audio) > TARGET_SAMPLES:
         audio = audio[:TARGET_SAMPLES]
-    # Peak normalize
-    peak = np.abs(audio).max()
+    peak = float(np.abs(audio).max())
     if peak > 1e-6:
         audio = audio / peak
     return audio[np.newaxis].astype(np.float32)  # (1, 32000)
 
-# ── Model loading ─────────────────────────────────────────────────────────────
 
-torch_model = None
+# ── Model loading ─────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def load_model():
-    global session, torch_model
+    global session, torch_model, loaded_model_source
 
-    # 1. Check for PyTorch Checkpoint (.pt / .pth)
+    # 1. Primary: Load ONNX Model (identical binary to Android OnnxEngine)
+    onnx_candidates = [
+        Path("tatvaani_android/app/src/main/assets/tatvanet.onnx"),
+        Path("export/tatvanet.onnx"),
+        Path("tatvanet.onnx"),
+    ]
+    onnx_path = next((p for p in onnx_candidates if p.exists() and p.stat().st_size > 1_000_000), None)
+    if onnx_path is not None:
+        try:
+            session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            loaded_model_source = f"onnx:{onnx_path}"
+            log.info(f"ONNX model loaded from {onnx_path} (inputs={[i.name for i in session.get_inputs()]})")
+            return
+        except Exception as e:
+            log.warning(f"Failed to load ONNX model ({e}). Falling back to PyTorch checkpoint...")
+            session = None
+
+    # 2. Fallback: Load PyTorch Checkpoint (.pt) with strict=True
     pt_candidates = [
         Path("checkpoints/best_model.pt"),
         Path("checkpoints/best_tatvanet.pt"),
@@ -150,35 +143,20 @@ async def load_model():
             from model.tatvanet import TatvaNet
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             m = TatvaNet(sample_rate=16000, n_classes=2).to(device)
-            ckpt = torch.load(pt_path, map_location=device)
+            ckpt = torch.load(pt_path, map_location=device, weights_only=False)
             state = ckpt.get("model_state", ckpt)
-            m.load_state_dict(state, strict=False)
+            m.load_state_dict(state, strict=True)
             m.eval()
             torch_model = m
-            log.info(f"PyTorch model loaded successfully from {pt_path} on {device}")
+            loaded_model_source = f"pytorch:{pt_path}"
+            log.info(f"PyTorch model loaded (strict=True) from {pt_path} on {device}")
             return
         except Exception as e:
-            log.warning(f"Could not load PyTorch checkpoint ({e}). Falling back to ONNX...")
+            log.error(f"Could not load PyTorch checkpoint: {e}")
+            torch_model = None
 
-    # 2. Check for ONNX Model
-    candidates = [
-        Path("tatvaani_android/app/src/main/assets/tatvanet.onnx"),
-        Path("export/tatvanet.onnx"),
-        Path("tatvanet.onnx"),
-    ]
-    model_path = next((p for p in candidates if p.exists()), None)
+    log.warning("No ONNX or PyTorch model found — /predict will return mock response")
 
-    if model_path is None:
-        log.warning("No ONNX or PyTorch model found — /predict will return mock response")
-        return
-
-    try:
-        session = ort.InferenceSession(str(model_path))
-        log.info(f"ONNX model loaded from {model_path}")
-        log.info(f"Inputs: {[i.name for i in session.get_inputs()]}")
-    except Exception as e:
-        log.error(f"Failed to load ONNX model: {e}")
-        session = None
 
 # ── Request/Response schemas ──────────────────────────────────────────────────
 
@@ -198,7 +176,8 @@ class PredictResponse(BaseModel):
 async def health():
     return {
         "status":       "ok",
-        "model_loaded": session is not None,
+        "model_loaded": (session is not None) or (torch_model is not None),
+        "model_source": loaded_model_source,
     }
 
 
@@ -241,7 +220,6 @@ async def predict(request: PredictRequest):
 
     log.info(f"Received {len(audio)} samples ({len(audio)/16000:.2f}s)")
 
-    # Mock response if model not loaded
     if session is None and torch_model is None:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         log.warning("Model not loaded — returning mock response")
@@ -252,30 +230,20 @@ async def predict(request: PredictRequest):
             latency_ms = elapsed_ms
         )
 
-    # Run inference
+    # Run inference directly on raw audio tensor (1, 32000)
     try:
-        audio_tensor = prepare_audio_tensor(audio) # (1, 32000)
+        audio_tensor = prepare_audio_tensor(audio)  # (1, 32000)
 
-        if torch_model is not None:
+        if session is not None:
+            outputs = session.run(None, {"audio": audio_tensor})
+            logits = outputs[0][0]
+        else:
             import torch
             with torch.no_grad():
                 device = next(torch_model.parameters()).device
                 t_in = torch.from_numpy(audio_tensor).to(device)
                 out = torch_model(t_in)
                 logits = out["logits"][0].cpu().numpy()
-        else:
-            input_names = [i.name for i in session.get_inputs()]
-            feed = {"audio": audio_tensor}
-            if "spec_features" in input_names:
-                try:
-                    spec_tensor = extract_spec_features(audio_tensor[0])
-                except Exception as e:
-                    log.warning(f"Feature extraction failed, using dummy zeros: {e}")
-                    spec_tensor = np.zeros((1, 9, 128, TARGET_FRAMES), dtype=np.float32)
-                feed["spec_features"] = spec_tensor
-
-            outputs = session.run(None, feed)
-            logits = outputs[0][0]
 
         # Calculate continuous probability of fake
         if len(logits) == 2:
